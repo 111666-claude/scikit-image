@@ -34,6 +34,24 @@ def _check_factor(factor):
         raise ValueError('scale factor must be greater than 1')
 
 
+def _pyramid_expand(image, out_shape, sigma, order, mode, cval, channel_axis):
+    """Upsample to an explicit ``out_shape`` and smooth.
+
+    Using an explicit output shape (instead of a fixed integer factor) makes
+    the operation the exact inverse counterpart of the corresponding
+    reduction, including for odd-sized axes.
+    """
+    resized = resize(
+        image,
+        out_shape,
+        order=order,
+        mode=mode,
+        cval=cval,
+        anti_aliasing=False,
+    )
+    return _smooth(resized, sigma, mode, cval, channel_axis)
+
+
 def pyramid_reduce(
     image,
     downscale=2,
@@ -179,10 +197,7 @@ def pyramid_expand(
         # automatically determine sigma which covers > 99% of distribution
         sigma = 2 * upscale / 6.0
 
-    resized = resize(
-        image, out_shape, order=order, mode=mode, cval=cval, anti_aliasing=False
-    )
-    out = _smooth(resized, sigma, mode, cval, channel_axis)
+    out = _pyramid_expand(image, out_shape, sigma, order, mode, cval, channel_axis)
 
     return out
 
@@ -303,16 +318,19 @@ def pyramid_laplacian(
 ):
     """Yield images of the laplacian pyramid formed by the input image.
 
-    Each layer contains the difference between the downsampled and the
-    downsampled, smoothed image::
+    Each layer except the last contains the difference between a Gaussian
+    pyramid layer and the subsequent (coarser) Gaussian layer expanded back to
+    the finer layer's shape::
 
-        layer = resize(prev_layer) - smooth(resize(prev_layer))
+        layer = prev_layer - expand(next_layer)
 
-    Note that the first image of the pyramid will be the difference between the
-    original, unscaled image and its smoothed version. The total number of
-    images is `max_layer + 1`. In case all layers are computed, the last image
-    is either a one-pixel image or the image where the reduction does not
-    change its shape.
+    The last layer is the coarsest Gaussian pyramid layer itself, i.e. the
+    low-frequency residual. Keeping this residual allows the original image to
+    be reconstructed, up to floating-point precision, by starting from the
+    last layer and recursively expanding and adding the difference layers.
+    The total number of images is `max_layer + 1`. In case all layers are
+    computed, the last image is either a one-pixel image or the image where
+    the reduction does not change its shape.
 
     Parameters
     ----------
@@ -369,40 +387,56 @@ def pyramid_laplacian(
 
     current_shape = image.shape
 
-    smoothed_image = _smooth(image, sigma, mode, cval, channel_axis)
-    yield image - smoothed_image
-
+    # Determine the spatial axes used to size the pyramid. Channel axes are
+    # never downscaled.
     if channel_axis is not None:
         channel_axis = channel_axis % image.ndim
-        shape_without_channels = list(current_shape)
-        shape_without_channels.pop(channel_axis)
-        shape_without_channels = tuple(shape_without_channels)
+        spatial_shape = tuple(
+            d for ax, d in enumerate(current_shape) if ax != channel_axis
+        )
     else:
-        shape_without_channels = current_shape
+        spatial_shape = current_shape
 
-    # build downsampled images until max_layer is reached or downscale process
-    # does not change image size
-    if max_layer == -1:
-        max_layer = math.ceil(math.log(max(shape_without_channels), downscale))
+    # Preserve the historical ``max_layer`` semantics: a negative value (-1 by
+    # convention) builds all levels up to a single pixel along the largest
+    # spatial axis.
+    if max_layer < 0:
+        max_layer = math.ceil(math.log(max(spatial_shape), downscale))
 
-    for layer in range(max_layer):
-        if channel_axis is not None:
-            out_shape = tuple(
-                math.ceil(d / float(downscale)) if ax != channel_axis else d
-                for ax, d in enumerate(current_shape)
-            )
-        else:
-            out_shape = tuple(math.ceil(d / float(downscale)) for d in current_shape)
-
-        resized_image = resize(
-            smoothed_image,
-            out_shape,
+    # Gaussian pyramid levels G_0, G_1, ..., G_{max_layer}. Building the levels
+    # explicitly keeps the expected shape and exactly ``max_layer + 1`` layers,
+    # even when an explicitly large ``max_layer`` repeats a size-1 level.
+    gaussian_levels = [image]
+    layer_image = image
+    for _ in range(max_layer):
+        layer_image = pyramid_reduce(
+            layer_image,
+            downscale=downscale,
+            sigma=sigma,
             order=order,
             mode=mode,
             cval=cval,
-            anti_aliasing=False,
+            preserve_range=True,
+            channel_axis=channel_axis,
         )
-        smoothed_image = _smooth(resized_image, sigma, mode, cval, channel_axis)
-        current_shape = resized_image.shape
+        gaussian_levels.append(layer_image)
 
-        yield resized_image - smoothed_image
+    # Each Laplacian detail layer is the difference between a fine Gaussian
+    # level and the subsequent coarser level expanded back to the fine shape.
+    # Expanding to the exact fine-layer shape (rather than a fixed factor) is
+    # what keeps odd-sized axes invertible.
+    for layer in range(max_layer):
+        expanded_image = _pyramid_expand(
+            gaussian_levels[layer + 1],
+            gaussian_levels[layer].shape,
+            sigma,
+            order,
+            mode,
+            cval,
+            channel_axis,
+        )
+        yield gaussian_levels[layer] - expanded_image
+
+    # The coarsest Gaussian level is the low-frequency residual. It is not a
+    # difference and provides the starting point for reconstruction.
+    yield gaussian_levels[max_layer]

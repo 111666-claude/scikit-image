@@ -13,6 +13,11 @@ __all__ = [
 ]
 
 from _skimage2.transform.pyramids import _check_factor  # noqa: F401
+from _skimage2.transform.pyramids import (  # noqa: F401
+    _pyramid_expand,
+    _smooth,
+    resize,
+)
 
 from skimage._doctest_adapters import adapt_doctests
 
