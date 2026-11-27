@@ -5,6 +5,51 @@ from skimage._shared._warnings import warn_external
 from skimage._shared.coord import ensure_spacing
 
 
+def _default_footprint(min_distance, ndim, p_norm):
+    """Create the default neighborhood for `peak_local_max`.
+
+    The footprint only connects coordinates whose Minkowski distance is
+    strictly smaller than `min_distance`. Pairs at exactly `min_distance`
+    are left for `ensure_spacing`, which is responsible for enforcing the
+    inclusive distance bound and its tie-breaking rules.
+    """
+    # Keep the large pre-filtering neighborhood close to the historical
+    # hypercube, but end it immediately before the inclusive distance bound.
+    # Tightening the bounding box also makes the common Chebyshev footprint
+    # dense, allowing scipy to use its separable maximum-filter path.
+    radius = int(np.ceil(min_distance)) - 1
+    size = 2 * radius + 1
+
+    # A large non-rectangular footprint makes scipy's generic ND filter path
+    # prohibitively expensive. In that case use only the immediate local
+    # neighborhood; ``ensure_spacing`` still applies the full distance rule.
+    if not np.isinf(p_norm) and size**ndim > 100_000:
+        radius = 1
+        size = 3
+
+    footprint = np.zeros((size,) * ndim, dtype=bool)
+
+    indices = np.indices(footprint.shape) - radius
+    abs_indices = np.abs(indices)
+
+    if np.isinf(p_norm):
+        distance = np.max(abs_indices, axis=0)
+    elif p_norm == 1:
+        distance = np.sum(abs_indices, axis=0)
+    elif p_norm == 2:
+        distance = np.sqrt(np.sum(indices**2, axis=0))
+    else:
+        # Scale before exponentiating so that large finite p norms do not
+        # overflow while constructing the default footprint.
+        max_abs = np.max(abs_indices, axis=0)
+        scale = np.where(max_abs == 0, 1, max_abs)
+        scaled = abs_indices / scale
+        distance = max_abs * np.sum(scaled**p_norm, axis=0) ** (1 / p_norm)
+
+    footprint[distance < min_distance] = True
+    return footprint
+
+
 def _get_high_intensity_peaks(image, mask, num_peaks, min_distance, p_norm):
     """
     Return the highest intensity peak coordinates.
@@ -121,8 +166,10 @@ def peak_local_max(
 ):
     """Find peaks in an image as coordinate list.
 
-    Peaks are the local maxima in a region of ``floor(2 * min_distance + 1)``
-    (i.e. peaks are separated by at least `min_distance`).
+    Peaks are selected so that their Minkowski distance (see `p_norm`) is at
+    least `min_distance`. The default maximum-filter footprint only compares
+    positions at a distance strictly smaller than `min_distance`, so peaks
+    separated by exactly `min_distance` remain eligible for final selection.
 
     If both `threshold_abs` and `threshold_rel` are provided, the maximum
     of the two is chosen as the minimum intensity threshold of peaks.
@@ -159,8 +206,11 @@ def peak_local_max(
         intensity.
     footprint : ndarray of dtype bool, optional
         Binary mask that determines the neighborhood (where ``True``) in which
-        a peak must be a local maximum (see *Notes*). If not given, defaults to
-        an array of ones of size ``floor(2 * min_distance + 1)``.
+        a peak must be a local maximum (see *Notes*). If not given, the
+        neighborhood is derived from `min_distance` and `p_norm`: it contains
+        offsets whose Minkowski distance is strictly smaller than
+        `min_distance`. For ``min_distance=1``, the historical full
+        three-pixel-wide hypercube is used.
     labels : ndarray of dtype int, optional
         If provided, each unique region `labels == value` represents a unique
         region to search for peaks. Zero labels are reserved for background.
@@ -207,9 +257,10 @@ def peak_local_max(
     array([[3, 2],
            [3, 4]])
 
-    Ensure peaks are at least 2 pixels apart
+    Peaks exactly 2 pixels apart are both allowed
     >>> ski2.feature.peak_local_max(image, min_distance=2)
-    array([[3, 2]])
+    array([[3, 2],
+           [3, 4]])
 
     Allow peaks on the image border
     >>> ski2.feature.peak_local_max(image, exclude_border=0)
@@ -229,9 +280,15 @@ def peak_local_max(
     threshold = _get_threshold(image, threshold_abs, threshold_rel)
 
     if footprint is None:
-        size = 2 * min_distance + 1
-        size = int(np.floor(size))
-        footprint = np.ones((size,) * image.ndim, dtype=bool)
+        if min_distance <= 1:
+            # Keep the established unit neighborhood (including its
+            # plateau handling) for the historical default distance.
+            size = int(np.floor(2 * min_distance + 1))
+            footprint = np.ones((size,) * image.ndim, dtype=bool)
+        else:
+            footprint = _default_footprint(
+                min_distance=min_distance, ndim=image.ndim, p_norm=p_norm
+            )
     else:
         footprint = np.asarray(footprint)
 

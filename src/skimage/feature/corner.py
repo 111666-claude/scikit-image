@@ -1204,6 +1204,13 @@ def corner_peaks(
     if np.isinf(num_peaks_per_label):
         num_peaks_per_label = None
 
+    # corner_peaks has historically used the inclusive hypercube footprint
+    # below and performs its own follow-up spacing pass. Keep that convention
+    # instead of inheriting peak_local_max's boundary-aware default.
+    if footprint is None:
+        size = int(np.floor(2 * min_distance + 1))
+        footprint = np.ones((size,) * image.ndim, dtype=bool)
+
     # Get the coordinates of the detected peaks
     coords = peak_local_max(
         image,

@@ -541,6 +541,19 @@ class TestPeakLocalMax:
         peaks = peak.peak_local_max(image, min_distance=2.83, p_norm=2)
         assert_equal(peaks, [[2, 2]])
 
+    def test_exact_min_distance_does_not_suppress_weaker_peak(self):
+        image = np.array([1, 0, 2])
+
+        peaks = peak.peak_local_max(image, min_distance=2, exclude_border=0)
+
+        assert_equal(peaks, [[2], [0]])
+
+        footprint = np.ones(5, dtype=bool)
+        peaks = peak.peak_local_max(
+            image, min_distance=2, exclude_border=0, footprint=footprint
+        )
+        assert_equal(peaks, [[2]])
+
 
 @pytest.mark.parametrize(
     ["indices"],

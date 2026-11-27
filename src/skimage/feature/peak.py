@@ -24,8 +24,10 @@ def peak_local_max(
 ):
     """Find peaks in an image as coordinate list.
 
-    Peaks are the local maxima in a region of ``floor(2 * min_distance + 1)``
-    (i.e. peaks are separated by at least `min_distance`).
+    Peaks are selected so that their Minkowski distance (see `p_norm`) is at
+    least `min_distance`. The default maximum-filter footprint only compares
+    positions at a distance strictly smaller than `min_distance`, so peaks
+    separated by exactly `min_distance` remain eligible for final selection.
 
     If both `threshold_abs` and `threshold_rel` are provided, the maximum
     of the two is chosen as the minimum intensity threshold of peaks.
@@ -68,8 +70,11 @@ def peak_local_max(
         return `num_peaks` peaks based on highest peak intensity.
     footprint : ndarray of bools, optional
         Binary mask that determines the neighborhood (where ``True``) in which
-        a peak must be a local maximum (see *Notes*). If not given, defaults to
-        an array of ones of size ``floor(2 * min_distance + 1)``.
+        a peak must be a local maximum (see *Notes*). If not given, the
+        neighborhood is derived from `min_distance` and `p_norm`: it contains
+        offsets whose Minkowski distance is strictly smaller than
+        `min_distance`. For ``min_distance=1``, the historical full
+        three-pixel-wide hypercube is used.
     labels : ndarray of ints, optional
         If provided, each unique region `labels == value` represents a unique
         region to search for peaks. Zero is reserved for background.
@@ -117,7 +122,8 @@ def peak_local_max(
            [3, 4]])
 
     >>> peak_local_max(img1, min_distance=2)
-    array([[3, 2]])
+    array([[3, 2],
+           [3, 4]])
 
     >>> img2 = np.zeros((20, 20, 20))
     >>> img2[10, 10, 10] = 1
