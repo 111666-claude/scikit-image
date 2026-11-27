@@ -109,6 +109,161 @@ def _add_edge_filter(values, graph):
     return 0.0
 
 
+def _validate_footprint(footprint, ndim):
+    """Validate a custom neighborhood `footprint` for building a RAG.
+
+    A RAG edge is undirected, so the pixel neighborhood must be symmetric
+    around its unique center.
+
+    Parameters
+    ----------
+    footprint : array-like
+        The proposed neighborhood. It must have `ndim` dimensions, odd
+        lengths in every dimension, a truthy center element and be equal to
+        its reflection through the center.
+    ndim : int
+        Number of dimensions of the label image.
+
+    Returns
+    -------
+    footprint_bool : ndarray of bool
+        The footprint converted to a boolean array.
+
+    Raises
+    ------
+    ValueError
+        If the footprint dimensionality, shape/center or symmetry is invalid.
+    """
+    fp = np.asarray(footprint)
+
+    if fp.ndim != ndim:
+        raise ValueError(
+            f"Invalid footprint dimensions: `footprint.ndim` ({fp.ndim}) "
+            f"must match `label_image.ndim` ({ndim}). Expected a {ndim}D "
+            "footprint with the same number of dimensions as `label_image`."
+        )
+
+    if any(dim % 2 == 0 for dim in fp.shape):
+        raise ValueError(
+            "Invalid footprint center: `footprint` must have odd lengths in "
+            "every dimension so that it is centered on a unique center "
+            "element; got "
+            f"`footprint.shape == {fp.shape}`."
+        )
+
+    center = tuple(dim // 2 for dim in fp.shape)
+    fp = fp.astype(bool, copy=False)
+
+    if not fp[center]:
+        raise ValueError(
+            "Invalid footprint center: the center element of `footprint` "
+            f"(`footprint{center}`) must be True (non-zero); got False (zero)."
+        )
+
+    # An undirected neighborhood must contain the offset opposite to every
+    # included offset, i.e. it is invariant under reflection through its
+    # center (flip every axis).
+    reflected = fp[tuple(slice(None, None, -1) for _ in range(ndim))]
+    if not np.array_equal(fp, reflected):
+        raise ValueError(
+            "Invalid/asymmetric footprint: `footprint` must be symmetric "
+            "about its center (symmetry under reflection through the center, "
+            "`footprint == footprint[::-1, ::-1, ...]`); an asymmetric "
+            "neighborhood would be directed while RAG edges are undirected."
+        )
+
+    return fp
+
+
+def _add_edges_from_footprint(graph, label_image, footprint):
+    """Add unordered region edges for every pixel offset in `footprint`.
+
+    Every active footprint position is interpreted as an offset from the
+    footprint's center. For each offset, all in-bounds pixel pairs separated
+    by that offset are compared and an edge is added between their labels when
+    they differ. Out-of-bounds pairs are skipped explicitly (no boundary
+    padding), self pairs are excluded and duplicate edges are collapsed by the
+    undirected graph.
+
+    Parameters
+    ----------
+    graph : RAG
+        The graph to add edges to.
+    label_image : ndarray of int
+        The labelled image.
+    footprint : ndarray of bool
+        A validated, centrally symmetric footprint with an active center.
+    """
+    center = tuple(size // 2 for size in footprint.shape)
+    offsets = np.argwhere(footprint) - np.asarray(center, dtype=np.intp)
+
+    for offset in offsets:
+        offset = tuple(int(delta) for delta in offset)
+
+        # The zero offset only pairs a pixel with itself.
+        if all(delta == 0 for delta in offset):
+            continue
+
+        # No pair separated by `delta` exists along an axis when the offset
+        # reaches or exceeds that axis size. Skipping these offsets keeps all
+        # slices strictly in bounds for any image size.
+        if any(
+            abs(delta) >= size
+            for delta, size in zip(offset, label_image.shape, strict=True)
+        ):
+            continue
+
+        source_slices = []
+        target_slices = []
+        for axis, delta in enumerate(offset):
+            size = label_image.shape[axis]
+            if delta > 0:
+                source_slices.append(slice(0, size - delta))
+                target_slices.append(slice(delta, size))
+            elif delta < 0:
+                source_slices.append(slice(-delta, size))
+                target_slices.append(slice(0, size + delta))
+            else:
+                source_slices.append(slice(None))
+                target_slices.append(slice(None))
+
+        source_pixels = label_image[tuple(source_slices)]
+        target_pixels = label_image[tuple(target_slices)]
+        different = source_pixels != target_pixels
+
+        if not np.any(different):
+            continue
+
+        pairs = np.stack((source_pixels[different], target_pixels[different]), axis=1)
+        # Store every edge as the canonical unordered pair ``(small, large)``
+        # and drop pairs repeated by symmetric offsets / multiple pixels.
+        pairs.sort(axis=1)
+        for low, high in np.unique(pairs, axis=0):
+            graph.add_edge(low.item(), high.item())
+
+
+def _looks_like_footprint(obj, ndim):
+    """Return True if `obj` can be validated as a footprint of `ndim`.
+
+    Used to disambiguate positional arguments that may either be NetworkX
+    graph data or a custom footprint.
+    """
+    if obj is None or isinstance(obj, nx.Graph):
+        return False
+    try:
+        arr = np.asarray(obj)
+    except Exception:
+        return False
+    if arr.ndim != ndim or any(dim % 2 == 0 for dim in arr.shape):
+        return False
+    bool_arr = arr.astype(bool, copy=False)
+    center = tuple(dim // 2 for dim in arr.shape)
+    if not bool_arr[center]:
+        return False
+    reflected = bool_arr[tuple(slice(None, None, -1) for _ in range(ndim))]
+    return np.array_equal(bool_arr, reflected)
+
+
 class RAG(nx.Graph):
     """The Region Adjacency Graph (RAG) of an image, subclasses :obj:`networkx.Graph`.
 
@@ -123,15 +278,46 @@ class RAG(nx.Graph):
         a connectivity of 1 corresponds to immediate neighbors up, down,
         left, and right, while a connectivity of 2 also includes diagonal
         neighbors. See :func:`scipy.ndimage.generate_binary_structure`.
+        Ignored when `footprint` is provided.
     data : :obj:`networkx.Graph` specification, optional
         Initial or additional edges to pass to :obj:`networkx.Graph`
         constructor. Valid edge specifications include edge list (list of tuples),
         NumPy arrays, and SciPy sparse matrices.
+    footprint : array of bool, optional
+        A custom pixel neighborhood. Every active element is interpreted as
+        an offset from the footprint's center; two regions are connected when
+        a pair of their pixels is separated by one of these offsets. The
+        footprint must have the same number of dimensions as `label_image`,
+        odd lengths in every dimension, an active (truthy) center and must be
+        symmetric about that center. If ``None`` (the default), the
+        neighborhood is derived from `connectivity`. A footprint array may
+        also be passed as the second positional argument in place of
+        `connectivity`.
     **attr : Any, optional
         Additional attributes to add to the graph.
     """
 
-    def __init__(self, label_image=None, connectivity=1, data=None, **attr):
+    def __init__(
+        self,
+        label_image=None,
+        connectivity=1,
+        data=None,
+        footprint=None,
+        **attr,
+    ):
+        # Normalize flexible positional conventions for `footprint`.
+        if label_image is not None and footprint is None:
+            label_ndim = np.asarray(label_image).ndim
+            # ``RAG(labels, footprint)`` shorthand.
+            if not isinstance(connectivity, (int, np.integer)):
+                footprint = connectivity
+                connectivity = 1
+            # Alternate order ``RAG(labels, connectivity, footprint)`` (where
+            # the third positional argument is otherwise graph ``data``).
+            elif _looks_like_footprint(data, label_ndim):
+                footprint = data
+                data = None
+
         super().__init__(data, **attr)
         if self.number_of_nodes() == 0:
             self.max_id = 0
@@ -139,24 +325,35 @@ class RAG(nx.Graph):
             self.max_id = max(self.nodes())
 
         if label_image is not None:
-            fp = ndi.generate_binary_structure(label_image.ndim, connectivity)
-            # In the next ``ndi.generic_filter`` function, the kwarg
-            # ``output`` is used to provide a strided array with a single
-            # 64-bit floating point number, to which the function repeatedly
-            # writes. This is done because even if we don't care about the
-            # output, without this, a float array of the same shape as the
-            # input image will be created and that could be expensive in
-            # memory consumption.
-            output = np.broadcast_to(1.0, label_image.shape)
-            output.setflags(write=True)
-            ndi.generic_filter(
-                label_image,
-                function=_add_edge_filter,
-                footprint=fp,
-                mode='nearest',
-                output=output,
-                extra_arguments=(self,),
-            )
+            label_image = np.asarray(label_image)
+
+            # The documented contract is that every unique label is a node,
+            # even if its region never touches a differently labelled pixel.
+            for label in np.unique(label_image):
+                self.add_node(label.item())
+
+            if footprint is None:
+                fp = ndi.generate_binary_structure(label_image.ndim, connectivity)
+                # In the next ``ndi.generic_filter`` function, the kwarg
+                # ``output`` is used to provide a strided array with a single
+                # 64-bit floating point number, to which the function repeatedly
+                # writes. This is done because even if we don't care about the
+                # output, without this, a float array of the same shape as the
+                # input image will be created and that could be expensive in
+                # memory consumption.
+                output = np.broadcast_to(1.0, label_image.shape)
+                output.setflags(write=True)
+                ndi.generic_filter(
+                    label_image,
+                    function=_add_edge_filter,
+                    footprint=fp,
+                    mode='nearest',
+                    output=output,
+                    extra_arguments=(self,),
+                )
+            else:
+                footprint = _validate_footprint(footprint, label_image.ndim)
+                _add_edges_from_footprint(self, label_image, footprint)
 
     def merge_nodes(
         self,
@@ -307,7 +504,14 @@ class RAG(nx.Graph):
         super().add_node(n)
 
 
-def rag_mean_color(image, labels, connectivity=2, mode='distance', sigma=255.0):
+def rag_mean_color(
+    image,
+    labels,
+    connectivity=2,
+    mode='distance',
+    sigma=255.0,
+    footprint=None,
+):
     """Compute the Region Adjacency Graph using mean colors.
 
     Given an image and its initial segmentation, this method constructs the
@@ -328,7 +532,8 @@ def rag_mean_color(image, labels, connectivity=2, mode='distance', sigma=255.0):
         Pixels with a squared distance less than `connectivity` from each other
         are considered adjacent. It can range from 1 to `labels.ndim`. Its
         behavior is the same as `connectivity` parameter in
-        ``scipy.ndimage.generate_binary_structure``.
+        ``scipy.ndimage.generate_binary_structure``. Ignored when `footprint`
+        is provided.
     mode : {'distance', 'similarity'}, optional
         The strategy to assign edge weights.
 
@@ -346,6 +551,12 @@ def rag_mean_color(image, labels, connectivity=2, mode='distance', sigma=255.0):
         close to each other two colors should be, for their corresponding edge
         weight to be significant. A very large value of `sigma` could make
         any two colors behave as though they were similar.
+    footprint : array of bool, optional
+        A custom symmetric pixel neighborhood used to establish region
+        adjacency, with the same constraints as the `footprint` parameter of
+        :class:`RAG`. If ``None``, adjacency follows `connectivity`. The
+        color statistics of each region are always computed from its own
+        pixels only and are unaffected by this parameter.
 
     Returns
     -------
@@ -365,7 +576,22 @@ def rag_mean_color(image, labels, connectivity=2, mode='distance', sigma=255.0):
            "Regions Adjacency Graph Applied To Color Image Segmentation"
            :DOI:`10.1109/83.841950`
     """
-    graph = RAG(labels, connectivity=connectivity)
+    # Compatibility with an alternate positional order in which `footprint`
+    # is passed before `mode`, e.g.
+    # ``rag_mean_color(image, labels, 2, footprint, 'similarity')``.
+    if not isinstance(mode, str) and isinstance(mode, (np.ndarray, list, tuple)):
+        alternate_footprint = mode
+        alternate_mode = 'distance'
+        alternate_sigma = 255.0
+        if isinstance(sigma, str):
+            alternate_mode = sigma
+            if footprint is not None and isinstance(footprint, (int, float, np.number)):
+                alternate_sigma = float(footprint)
+        footprint = alternate_footprint
+        mode = alternate_mode
+        sigma = alternate_sigma
+
+    graph = RAG(labels, connectivity=connectivity, footprint=footprint)
 
     for n in graph:
         graph.nodes[n].update(
