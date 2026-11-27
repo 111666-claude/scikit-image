@@ -153,6 +153,207 @@ def _blob_overlap(blob1, blob2, *, sigma_dim=1):
         return _compute_sphere_overlap(d, r1, r2)
 
 
+def _blob_overlap_batch(d, radius_ratio, ndim):
+    """Vectorized overlap fraction for batches of blob pairs.
+
+    This is the batched counterpart of :func:`_compute_disk_overlap` and
+    :func:`_compute_sphere_overlap`. It assumes that the center distance ``d``
+    is already rescaled by the larger blob scale and that
+    ``0 <= radius_ratio <= 1`` is the ratio between the smaller and the
+    larger scale.
+
+    Parameters
+    ----------
+    d : ndarray
+        Normalized center distances.
+    radius_ratio : ndarray
+        Normalized radius of the smaller blob.
+    ndim : int
+        Spatial dimension, must be 2 or 3.
+
+    Returns
+    -------
+    overlap : ndarray
+        Fraction of the smaller blob's area (or volume in 3D) that is
+        overlapped.
+    """
+    d = np.asarray(d, dtype=np.float64)
+    radius_ratio = np.asarray(radius_ratio, dtype=np.float64)
+
+    overlap = np.zeros_like(d)
+
+    # One blob is fully inside the other.
+    inside = d <= np.abs(1.0 - radius_ratio)
+    overlap[inside] = 1.0
+
+    # Centers farther apart than the sum of the radii do not overlap.
+    disjoint = d >= 1.0 + radius_ratio
+
+    middle = ~inside & ~disjoint
+    if not np.any(middle):
+        return overlap
+
+    dm = d[middle]
+    rm = radius_ratio[middle]
+
+    if ndim == 2:
+        ratio1 = (dm**2 + 1.0 - rm**2) / (2.0 * dm)
+        ratio1 = np.clip(ratio1, -1.0, 1.0)
+        acos1 = np.arccos(ratio1)
+
+        ratio2 = (dm**2 + rm**2 - 1.0) / (2.0 * dm * rm)
+        ratio2 = np.clip(ratio2, -1.0, 1.0)
+        acos2 = np.arccos(ratio2)
+
+        products = (
+            (-dm + rm + 1.0) * (dm - rm + 1.0) * (dm + rm - 1.0) * (dm + rm + 1.0)
+        )
+        area = acos1 + rm**2 * acos2 - 0.5 * np.sqrt(np.maximum(products, 0.0))
+        overlap[middle] = area / (math.pi * rm**2)
+    else:
+        volume = (
+            math.pi
+            / (12.0 * dm)
+            * (1.0 + rm - dm) ** 2
+            * (dm**2 + 2.0 * dm * (1.0 + rm) - 3.0 * (1.0 + rm**2) + 6.0 * rm)
+        )
+        overlap[middle] = volume / (4.0 / 3.0 * math.pi * rm**3)
+
+    return overlap
+
+
+# Candidate count below which the historical pair-set implementation is used
+# verbatim. Above it, the streaming implementation avoids materializing the
+# potentially quadratic set of all nearby pairs.
+_PRUNE_PAIRSET_LIMIT = 256
+
+
+def _prune_blobs_classic(blobs_array, overlap, *, sigma_dim=1):
+    """Historical pruning implementation based on ``cKDTree.query_pairs``.
+
+    It materializes every pair closer than a global, worst-case distance in a
+    Python set, which can require quadratic memory in the number of
+    candidates. It is kept for small candidate sets where its overhead is
+    negligible and its output is unchanged.
+    """
+    sigma = blobs_array[:, -sigma_dim:].max()
+    distance = 2 * sigma * math.sqrt(blobs_array.shape[1] - sigma_dim)
+    tree = spatial.cKDTree(blobs_array[:, :-sigma_dim])
+    pairs = np.array(list(tree.query_pairs(distance)))
+    if len(pairs) == 0:
+        return blobs_array
+
+    for i, j in pairs:
+        blob1, blob2 = blobs_array[i], blobs_array[j]
+        if _blob_overlap(blob1, blob2, sigma_dim=sigma_dim) > overlap:
+            # note: this test works even in the anisotropic case because
+            # all sigmas increase together.
+            if blob1[-1] > blob2[-1]:
+                blob2[-1] = 0
+            else:
+                blob1[-1] = 0
+
+    kept = [b for b in blobs_array if b[-1] > 0]
+    if not kept:
+        return np.empty((0, blobs_array.shape[1]), dtype=blobs_array.dtype)
+    return np.stack(kept)
+
+
+def _prune_blobs_streaming(blobs_array, overlap, *, sigma_dim=1):
+    """Prune overlapping blobs without storing all candidate pairs.
+
+    Pairs are visited in lexicographic index order, matching a direct
+    pairwise reference implementation (nested ``i < j`` loops with the same
+    elimination rule). A :class:`scipy.spatial.cKDTree` range query per blob
+    restricts the work to pairs that can possibly overlap, and no pair set is
+    materialized, so peak memory does not grow with the total number of
+    nearby pairs.
+    """
+    n_blobs = blobs_array.shape[0]
+    ndim = blobs_array.shape[1] - sigma_dim
+
+    # _blob_overlap always returns 0 for more than 3 spatial dimensions.
+    if ndim > 3:
+        return blobs_array
+
+    positions = blobs_array[:, :ndim]
+    sqrt_ndim = math.sqrt(ndim)
+    tree = spatial.cKDTree(positions)
+
+    # Fast vectorized path for isotropic sigmas in 2D/3D, which covers
+    # blob_dog, blob_log and blob_doh with scalar sigma.
+    if sigma_dim == 1 and ndim in (2, 3):
+        sigmas = blobs_array[:, -1].astype(np.float64, copy=True)
+        alive = np.ones(n_blobs, dtype=bool)
+
+        # Maximum later sigma for each index gives a safe per-blob query
+        # radius: any overlapping pair satisfies
+        # d <= (sigma_i + sigma_j) * sqrt(ndim).
+        suffix_max = np.zeros(n_blobs + 1, dtype=np.float64)
+        for i in range(n_blobs - 1, -1, -1):
+            suffix_max[i] = max(sigmas[i], suffix_max[i + 1])
+
+        for i in range(n_blobs):
+            if not alive[i] or sigmas[i] <= 0:
+                continue
+
+            sigma_i = sigmas[i]
+            radius = (sigma_i + suffix_max[i + 1]) * sqrt_ndim
+            radius *= 1.0 + 1e-12
+            neighbors = tree.query_ball_point(positions[i], radius)
+            js = sorted(j for j in neighbors if j > i and alive[j])
+            if not js:
+                continue
+
+            js = np.asarray(js, dtype=np.intp)
+            sigma_j = sigmas[js]
+            sigma_max = np.maximum(sigma_i, sigma_j)
+
+            distance = np.linalg.norm(positions[js] - positions[i], axis=1) / (
+                sigma_max * sqrt_ndim
+            )
+            radius_ratio = np.minimum(sigma_i, sigma_j) / sigma_max
+            fractions = _blob_overlap_batch(distance, radius_ratio, ndim)
+            qualifying = np.flatnonzero(fractions > overlap)
+            if qualifying.size == 0:
+                continue
+
+            # In lexicographic order, a qualifying pair with
+            # sigma_j >= sigma_i eliminates blob i (the lower index). Pairs
+            # after the first such event cannot affect the result anymore.
+            killers = qualifying[sigma_j[qualifying] >= sigma_i]
+            if killers.size:
+                first_killer = killers[0]
+                before = qualifying[qualifying < first_killer]
+                alive[js[before]] = False
+                alive[i] = False
+            else:
+                alive[js[qualifying]] = False
+
+        blobs_array[~alive, -1] = 0
+        return blobs_array[alive]
+
+    # Scalar fallback for anisotropic sigmas and ndim == 1. Stream the same
+    # global-radius pairs in lexicographic order and reuse _blob_overlap
+    # exactly, preserving all historical edge-case behavior.
+    sigma = blobs_array[:, -sigma_dim:].max()
+    distance = 2 * sigma * sqrt_ndim
+    for i in range(n_blobs):
+        neighbors = tree.query_ball_point(positions[i], distance)
+        for j in sorted(j for j in neighbors if j > i):
+            blob1, blob2 = blobs_array[i], blobs_array[j]
+            if _blob_overlap(blob1, blob2, sigma_dim=sigma_dim) > overlap:
+                if blob1[-1] > blob2[-1]:
+                    blob2[-1] = 0
+                else:
+                    blob1[-1] = 0
+
+    kept = [b for b in blobs_array if b[-1] > 0]
+    if not kept:
+        return np.empty((0, blobs_array.shape[1]), dtype=blobs_array.dtype)
+    return np.stack(kept)
+
+
 def _prune_blobs(blobs_array, overlap, *, sigma_dim=1):
     """Eliminated blobs with area overlap.
 
@@ -177,24 +378,13 @@ def _prune_blobs(blobs_array, overlap, *, sigma_dim=1):
     A : ndarray
         `array` with overlapping blobs removed.
     """
-    sigma = blobs_array[:, -sigma_dim:].max()
-    distance = 2 * sigma * math.sqrt(blobs_array.shape[1] - sigma_dim)
-    tree = spatial.cKDTree(blobs_array[:, :-sigma_dim])
-    pairs = np.array(list(tree.query_pairs(distance)))
-    if len(pairs) == 0:
+    if blobs_array.shape[0] == 0:
         return blobs_array
-    else:
-        for i, j in pairs:
-            blob1, blob2 = blobs_array[i], blobs_array[j]
-            if _blob_overlap(blob1, blob2, sigma_dim=sigma_dim) > overlap:
-                # note: this test works even in the anisotropic case because
-                # all sigmas increase together.
-                if blob1[-1] > blob2[-1]:
-                    blob2[-1] = 0
-                else:
-                    blob1[-1] = 0
 
-    return np.stack([b for b in blobs_array if b[-1] > 0])
+    if blobs_array.shape[0] <= _PRUNE_PAIRSET_LIMIT:
+        return _prune_blobs_classic(blobs_array, overlap, sigma_dim=sigma_dim)
+
+    return _prune_blobs_streaming(blobs_array, overlap, sigma_dim=sigma_dim)
 
 
 def _format_exclude_border(img_ndim, exclude_border):
