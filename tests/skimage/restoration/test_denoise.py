@@ -4,7 +4,11 @@ import importlib.util
 
 import numpy as np
 import pytest
-from numpy.testing import assert_array_almost_equal, assert_array_equal
+from numpy.testing import (
+    assert_allclose,
+    assert_array_almost_equal,
+    assert_array_equal,
+)
 
 from skimage import color, data, img_as_float, restoration
 from _skimage2._shared._warnings import expected_warnings
@@ -170,6 +174,97 @@ def test_denoise_tv_chambolle_weighting():
     ssim = structural_similarity(denoised_2d, denoised_4d[:, :, 0, 0], data_range=1.0)
     assert ssim > 0.98  # clsoe to 1.0
     assert ssim_2d > ssim_noisy  # quality must increase after denoising
+
+
+def test_denoise_tv_chambolle_spacing_analytic():
+    """Two-pixel step with anisotropic spacing has a known analytic optimum.
+
+    Chambolle's iteration converges to the minimizer of
+
+        ||u - f||**2 + 2 * weight * TV(u)
+
+    so for two pixels with values f1, f2 and spacing s along the step axis
+    the optimum for f = [0, 1] is u = [weight / s, 1 - weight / s]
+    (provided weight / s < 1/2, i.e. the step is not collapsed).
+    """
+    img = np.array([[0.0, 1.0]])
+    # step along axis 1 with spacing 2 -> shift of 0.2 / 2 = 0.1
+    res = restoration.denoise_tv_chambolle(
+        img, weight=0.2, eps=1e-13, max_num_iter=10000, spacing=(1, 2)
+    )
+    assert_allclose(res, [[0.1, 0.9]], atol=1e-8)
+    # unit spacing along the step axis -> shift of 0.2 / 1 = 0.2
+    res = restoration.denoise_tv_chambolle(
+        img, weight=0.2, eps=1e-13, max_num_iter=10000, spacing=(1, 1)
+    )
+    assert_allclose(res, [[0.2, 0.8]], atol=1e-8)
+
+
+def test_denoise_tv_chambolle_spacing_default_matches():
+    """No spacing or all-unit spacing must reproduce the original result."""
+    rstate = np.random.default_rng(1234)
+    img2d = rstate.random((16, 16))
+    img3d = rstate.random((8, 8, 8))
+    for img, spacing in [(img2d, (1, 1)), (img3d, (1, 1, 1))]:
+        res_default = restoration.denoise_tv_chambolle(img, weight=0.1)
+        res_none = restoration.denoise_tv_chambolle(img, weight=0.1, spacing=None)
+        res_unit = restoration.denoise_tv_chambolle(img, weight=0.1, spacing=spacing)
+        assert_array_equal(res_default, res_none)
+        assert_array_equal(res_default, res_unit)
+
+
+def test_denoise_tv_chambolle_spacing_2d_vs_3d():
+    """Per-axis spacing must weight directions consistently in 2D and 3D."""
+    rstate = np.random.default_rng(42)
+    img2d = rstate.random((16, 16))
+    # constant along the third axis: only axes 0 and 1 carry gradients
+    img3d = np.tile(img2d[:, :, np.newaxis], (1, 1, 3))
+    res2d = restoration.denoise_tv_chambolle(
+        img2d, weight=0.2, eps=1e-14, max_num_iter=50000, spacing=(1, 2)
+    )
+    res3d = restoration.denoise_tv_chambolle(
+        img3d, weight=0.2, eps=1e-14, max_num_iter=50000, spacing=(1, 2, 5)
+    )
+    # both converge to the same (unique) minimizer, independent of the
+    # spacing along the gradient-free third axis
+    assert_allclose(res3d[..., 0], res2d, atol=1e-6)
+    assert_allclose(res3d[..., 1], res2d, atol=1e-6)
+
+
+def test_denoise_tv_chambolle_spacing_channel_axis():
+    """The channel axis must not take part in the spatial gradient."""
+    img = astro.copy()
+    spacing = (1, 2)
+    denoised = restoration.denoise_tv_chambolle(
+        img, weight=0.1, channel_axis=-1, spacing=spacing
+    )
+    for c in range(img.shape[-1]):
+        denoised_c = restoration.denoise_tv_chambolle(
+            img[..., c], weight=0.1, spacing=spacing
+        )
+        assert_array_equal(denoised[..., c], denoised_c)
+
+
+def test_denoise_tv_chambolle_spacing_invalid():
+    img = np.zeros((8, 8))
+    # wrong length
+    with pytest.raises(ValueError, match='length 2'):
+        restoration.denoise_tv_chambolle(img, spacing=(1, 1, 1))
+    with pytest.raises(ValueError, match='length 2'):
+        restoration.denoise_tv_chambolle(img, spacing=1)
+    # wrong length when a channel axis is present (channel axis excluded)
+    with pytest.raises(ValueError, match='length 2'):
+        restoration.denoise_tv_chambolle(
+            np.zeros((8, 8, 3)), channel_axis=-1, spacing=(1, 1, 1)
+        )
+    # non-finite values
+    for bad in [(1, np.inf), (1, np.nan)]:
+        with pytest.raises(ValueError, match='finite and positive'):
+            restoration.denoise_tv_chambolle(img, spacing=bad)
+    # non-positive values
+    for bad in [(1, 0), (1, -1)]:
+        with pytest.raises(ValueError, match='finite and positive'):
+            restoration.denoise_tv_chambolle(img, spacing=bad)
 
 
 def test_denoise_tv_bregman_2d():

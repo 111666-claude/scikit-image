@@ -402,7 +402,9 @@ def denoise_tv_bregman(
     return np.squeeze(out[1:-1, 1:-1])
 
 
-def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
+def _denoise_tv_chambolle_nd(
+    image, weight=0.1, eps=2.0e-4, max_num_iter=200, spacing=None
+):
     """Perform total-variation denoising on n-dimensional images.
 
     Parameters
@@ -420,6 +422,9 @@ def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
 
     max_num_iter : int, optional
         Maximal number of iterations used for the optimization.
+    spacing : sequence of float, optional
+        Physical spacing between samples along each axis of `image`. If not
+        given, all axes are assumed to have unit spacing.
 
     Returns
     -------
@@ -432,14 +437,23 @@ def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
     """
 
     ndim = image.ndim
+    if spacing is None:
+        spacing = np.ones(ndim)
+    else:
+        spacing = np.asarray(spacing, dtype=image.dtype)
+    # factors used to scale the gradient and divergence along each axis
+    inv_spacing = 1.0 / spacing
+    inv_spacing_bc = inv_spacing.reshape((-1,) + (1,) * ndim)
     p = np.zeros((image.ndim,) + image.shape, dtype=image.dtype)
     g = np.zeros_like(p)
     d = np.zeros_like(image)
     i = 0
     while i < max_num_iter:
         if i > 0:
-            # d will be the (negative) divergence of p
-            d = -p.sum(0)
+            # d will be the (negative) divergence of p, with each axis
+            # scaled by its inverse physical spacing
+            q = p * inv_spacing_bc
+            d = -q.sum(0)
             slices_d = [
                 slice(None),
             ] * ndim
@@ -450,7 +464,7 @@ def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
                 slices_d[ax] = slice(1, None)
                 slices_p[ax + 1] = slice(0, -1)
                 slices_p[0] = ax
-                d[tuple(slices_d)] += p[tuple(slices_p)]
+                d[tuple(slices_d)] += q[tuple(slices_p)]
                 slices_d[ax] = slice(None)
                 slices_p[ax + 1] = slice(None)
             out = image + d
@@ -466,12 +480,12 @@ def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
         for ax in range(ndim):
             slices_g[ax + 1] = slice(0, -1)
             slices_g[0] = ax
-            g[tuple(slices_g)] = np.diff(out, axis=ax)
+            g[tuple(slices_g)] = np.diff(out, axis=ax) * inv_spacing[ax]
             slices_g[ax + 1] = slice(None)
 
         norm = np.sqrt((g**2).sum(axis=0))[np.newaxis, ...]
         E += weight * norm.sum()
-        tau = 1.0 / (2.0 * ndim)
+        tau = 1.0 / (2.0 * (inv_spacing**2).sum())
         norm *= tau / weight
         norm += 1.0
         p -= tau * g
@@ -490,7 +504,13 @@ def _denoise_tv_chambolle_nd(image, weight=0.1, eps=2.0e-4, max_num_iter=200):
 
 
 def denoise_tv_chambolle(
-    image, weight=0.1, eps=2.0e-4, max_num_iter=200, *, channel_axis=None
+    image,
+    weight=0.1,
+    eps=2.0e-4,
+    max_num_iter=200,
+    *,
+    channel_axis=None,
+    spacing=None,
 ):
     r"""Perform total variation denoising in nD.
 
@@ -536,6 +556,16 @@ def denoise_tv_chambolle(
 
         .. versionadded:: 0.19
            ``channel_axis`` was added in 0.19.
+    spacing : sequence of float, optional
+        Physical spacing between samples (voxels) along each spatial axis of
+        `image`. The gradient in the total variation term is computed with
+        respect to these physical distances, so that axes with different
+        sample spacing contribute proportionally. If `channel_axis` is given,
+        `spacing` must not include the channel axis. By default, a spacing of
+        1 is assumed along every axis, which reproduces the historical
+        behavior.
+
+        .. versionadded:: 0.26
 
     Returns
     -------
@@ -597,14 +627,35 @@ def denoise_tv_chambolle(
 
     if channel_axis is not None:
         channel_axis = channel_axis % image.ndim
+        ndim_spatial = image.ndim - 1
+    else:
+        ndim_spatial = image.ndim
+
+    if spacing is None:
+        spacing = np.ones(ndim_spatial, dtype=float_dtype)
+    else:
+        spacing = np.asarray(spacing, dtype=float_dtype)
+        if spacing.ndim != 1 or spacing.size != ndim_spatial:
+            raise ValueError(
+                f'`spacing` must be a 1D sequence of length {ndim_spatial} '
+                f'(one value per spatial axis), got shape {spacing.shape}.'
+            )
+        if not np.all(np.isfinite(spacing)) or np.any(spacing <= 0):
+            raise ValueError(
+                'All elements of `spacing` must be finite and positive.'
+            )
+
+    if channel_axis is not None:
         _at = functools.partial(utils.slice_at_axis, axis=channel_axis)
         out = np.zeros_like(image)
         for c in range(image.shape[channel_axis]):
             out[_at(c)] = _denoise_tv_chambolle_nd(
-                image[_at(c)], weight, eps, max_num_iter
+                image[_at(c)], weight, eps, max_num_iter, spacing=spacing
             )
     else:
-        out = _denoise_tv_chambolle_nd(image, weight, eps, max_num_iter)
+        out = _denoise_tv_chambolle_nd(
+            image, weight, eps, max_num_iter, spacing=spacing
+        )
     return out
 
 
