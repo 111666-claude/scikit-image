@@ -25,6 +25,83 @@ from ..morphology._util import _validate_connectivity, _offsets_to_raveled_neigh
 from ..util import crop, regular_seeds
 
 
+def _validate_periodic(periodic, ndim):
+    """Validate the per-axis periodic boundary specification.
+
+    Parameters
+    ----------
+    periodic : sequence of bool or None
+        One entry per image axis; ``True`` marks that axis as periodic
+        (its opposite borders are adjacent).
+    ndim : int
+        Number of dimensions of the image.
+
+    Returns
+    -------
+    periodic : ndarray of bool
+        The validated specification as a boolean array of length `ndim`.
+
+    Raises
+    ------
+    ValueError
+        If `periodic` does not contain exactly one boolean entry per axis.
+    """
+    if periodic is None:
+        return np.zeros(ndim, dtype=bool)
+    periodic = np.asarray(periodic, dtype=bool)
+    if periodic.ndim != 1 or periodic.shape[0] != ndim:
+        raise ValueError(
+            "`periodic` must be a sequence of booleans with one entry per "
+            f"image axis (expected length {ndim}, got shape {periodic.shape})"
+        )
+    return periodic
+
+
+def _raveled_neighbor_steps(image_shape, footprint, center):
+    """Per-axis signed steps and matching raveled offsets of each neighbor.
+
+    Returns the signed footprint step along every axis for each neighbor,
+    together with the corresponding raveled offset, ordered by Euclidean
+    distance from the footprint center (the center entry itself removed).
+
+    Unlike :func:`_offsets_to_raveled_neighbors`, the entries are *not*
+    deduplicated.  On a grid narrower than the footprint, two distinct 2D
+    neighbors can share a raveled offset; they still wrap to different
+    pixels along a periodic axis, so the periodic flood needs one entry per
+    footprint element.  The two returned arrays therefore always have the
+    same length and the same ordering, which lets the Cython flood pair each
+    raveled offset with its per-axis step without out-of-range indexing.
+
+    Parameters
+    ----------
+    image_shape : tuple of int
+        Shape of the (padded) image whose neighbors are described.
+    footprint : ndarray of bool
+        Footprint determining the neighborhood.
+    center : tuple of int
+        Center index of `footprint`.
+
+    Returns
+    -------
+    steps : ndarray of int of shape (n_neighbors, image.ndim)
+        Signed step (-1, 0 or 1 for a direct-neighbor footprint) of each
+        neighbor along every axis.
+    offsets : ndarray of int of shape (n_neighbors,)
+        Raveled offset of each neighbor, matching `steps` row by row.
+    """
+    coords = np.stack(
+        [(idx - c) for idx, c in zip(np.nonzero(footprint), center)], axis=-1
+    )
+    distances = np.sqrt(np.sum(coords.astype(float) ** 2, axis=1))
+    coords = coords[np.argsort(distances, kind="stable")]
+    coords = coords[1:]  # drop the zero step to the center
+    steps = coords.astype(np.intp, copy=False)
+
+    ravel_factors = np.cumprod((image_shape[1:] + (1,))[::-1])[::-1]
+    offsets = (steps * ravel_factors).sum(axis=1).astype(np.intp, copy=False)
+    return steps, np.ascontiguousarray(offsets)
+
+
 def _validate_inputs(image, markers, mask, connectivity):
     """Ensure that all inputs to watershed have matching shapes and types.
 
@@ -94,6 +171,7 @@ def watershed(
     mask=None,
     compactness=0,
     watershed_line=False,
+    periodic=None,
 ):
     """Find watershed basins in an image flooded from given markers.
 
@@ -129,6 +207,15 @@ def watershed(
         Note that the method used for adding this line expects that
         marker regions are not adjacent; the watershed line may not catch
         borders between adjacent marker regions.
+    periodic : sequence of bool, optional
+        Per-axis specification of periodic (toroidal) boundary conditions.
+        Must contain one boolean per axis of `image`; an axis set to ``True``
+        treats its first and last elements as neighbors, as if the image
+        wrapped around along that axis. For example, for a 2D image,
+        ``(False, True)`` wraps horizontally (along columns) while
+        ``(True, False)`` wraps vertically (along rows). If None (default),
+        ordinary, non-periodic boundaries are used along every axis.
+        Periodic boundaries are only supported for 2D images.
 
     Returns
     -------
@@ -163,6 +250,14 @@ def watershed(
     the local minima of the gradient of the image, or the local maxima of the
     distance function to the background for separating overlapping objects
     (see example).
+
+    When `periodic` is given, the corresponding axes are treated as toroidal:
+    pixels on opposite borders of a periodic axis are direct neighbors. The
+    flood propagation only ever connects pixels that are true neighbors along
+    the periodic axis -- a step past the end of a row wraps to the beginning
+    of the *same* row, never to a different row of the flattened array.
+    Markers, mask, connectivity, watershed lines and compactness keep the same
+    meaning as in the non-periodic case.
 
     References
     ----------
@@ -214,10 +309,18 @@ def watershed(
     """
     image, markers, mask = _validate_inputs(image, markers, mask, connectivity)
     connectivity, offset = _validate_connectivity(image.ndim, connectivity, offset)
+    periodic = _validate_periodic(periodic, image.ndim)
+    if periodic.any() and image.ndim != 2:
+        raise NotImplementedError(
+            "Periodic boundary conditions are currently only supported for "
+            f"2D images, but the input has {image.ndim} dimensions."
+        )
 
     # pad the image, markers, and mask so that we can use the mask to
-    # keep from running off the edges
-    pad_width = [(p, p) for p in offset]
+    # keep from running off the edges. Axes marked periodic are not padded:
+    # their border neighbors are wrapped to the opposite side instead, so
+    # no padding pixels must sit between the two physical borders.
+    pad_width = [(0, 0) if periodic[axis] else (p, p) for axis, p in enumerate(offset)]
     image = np.pad(image, pad_width, mode='constant')
     mask = np.pad(mask, pad_width, mode='constant').ravel()
     output = np.pad(markers, pad_width, mode='constant')
@@ -227,6 +330,27 @@ def watershed(
     )
     marker_locations = np.flatnonzero(output)
     image_strides = np.array(image.strides, dtype=np.intp) // image.itemsize
+    image_shape = np.array(image.shape, dtype=np.intp)
+    # `periodic` refers to the axes of the original image; the padded axes
+    # remain in the same order, so it can be passed unchanged.
+    periodic_padded = periodic.astype(np.int8, copy=False)
+    # Only needed (and only 2D) when an axis is periodic: the signed per-axis
+    # step of every neighbor plus a matching, non-deduplicated raveled offset.
+    # Using the full footprint keeps `structure` and the step arrays exactly
+    # aligned in length and order, so narrow grids cannot cause out-of-range
+    # indexing and distinct 2D neighbors that share a raveled offset are both
+    # visited.  Otherwise empty arrays are passed and the C code takes the
+    # plain, unchanged code path.
+    if periodic.any():
+        neighbor_steps, periodic_offsets = _raveled_neighbor_steps(
+            image.shape, connectivity, offset
+        )
+        step0 = np.ascontiguousarray(neighbor_steps[:, 0], dtype=np.intp)
+        step1 = np.ascontiguousarray(neighbor_steps[:, 1], dtype=np.intp)
+        flat_neighborhood = periodic_offsets
+    else:
+        step0 = np.empty(0, dtype=np.intp)
+        step1 = np.empty(0, dtype=np.intp)
 
     _watershed_cy.watershed_raveled(
         image.ravel(),
@@ -234,6 +358,10 @@ def watershed(
         flat_neighborhood,
         mask,
         image_strides,
+        image_shape,
+        periodic_padded,
+        step0,
+        step1,
         compactness,
         output.ravel(),
         watershed_line,
