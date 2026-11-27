@@ -55,7 +55,11 @@ def _compute_thin_image(pixel_type[:, :, ::1] img not None):
     This routine implements the two-pass algorithm of [Lee94]_. Namely,
     for each of the six border types (positive and negative x-, y- and z-),
     the algorithm first collects all possibly deletable points, and then
-    performs a sequential rechecking.
+    performs a sequential rechecking. During the rechecking, a candidate is
+    only deleted if it is still a simple point *and* is not the last
+    foreground voxel of its connected component. The latter condition, which
+    is not present in the original implementation [IAC15]_, prevents solid
+    objects (e.g., filled even-sized cubes) from being eroded away entirely.
 
     The input, `img`, is assumed to be a 3D binary image in the
     (p, r, c) format [i.e., C ordered array], filled by zeros (background) and
@@ -107,7 +111,12 @@ def _compute_thin_image(pixel_type[:, :, ::1] img not None):
                     r = point.r
                     c = point.c
                     get_neighborhood(img, p, r, c, neighb)
-                    if is_simple_point(neighb):
+                    # A candidate may have become the last foreground voxel of
+                    # its connected component since it was collected: neighbors
+                    # scheduled earlier in this same pass may have been deleted
+                    # already. Never delete such an isolated voxel, otherwise
+                    # entire (simply connected) objects can be eroded away.
+                    if not is_isolated_voxel(neighb) and is_simple_point(neighb):
                         img[p, r, c] = 0
                         no_change = False
 
@@ -316,6 +325,20 @@ cdef inline bint is_endpoint(pixel_type neighbors[]) noexcept nogil:
     for j in range(27):
         s += neighbors[j]
     return s == 2
+
+
+cdef inline bint is_isolated_voxel(pixel_type neighbors[]) noexcept nogil:
+    """An isolated voxel has no foreground in its 26-neighborhood.
+
+    Only the center voxel itself is foreground, so it is the last remaining
+    voxel of its connected component; deleting it would remove the component
+    entirely.
+    """
+    # The center pixel is counted, thus r.h.s. is 1
+    cdef int s = 0, j
+    for j in range(27):
+        s += neighbors[j]
+    return s == 1
 
 
 cdef bint is_simple_point(pixel_type neighbors[]) noexcept nogil:

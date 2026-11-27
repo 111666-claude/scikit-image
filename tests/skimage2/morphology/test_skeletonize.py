@@ -218,6 +218,92 @@ class TestSkeletonize:
         expected = io.imread(fetch("data/_blobs_3d_fiji_skeleton.tif")).astype(bool)
         assert_array_equal(result, expected)
 
+    @pytest.mark.parametrize(
+        "shape",
+        [
+            (16, 16, 16),
+            (16, 16, 15),
+            (15, 15, 15),
+            (8, 8, 8),
+            (6, 6, 6),
+            (4, 4, 4),
+            (2, 2, 2),
+            (16, 16, 14),
+            (4, 4, 5),
+            (2, 2, 3),
+        ],
+    )
+    def test_solid_box_does_not_vanish(self, shape):
+        # Filled boxes with even-sized extents used to be eroded away
+        # entirely, while odd-sized ones were not. The skeleton of a solid,
+        # simply connected object must stay non-empty and connected,
+        # regardless of size parity.
+        image = np.ones(shape, dtype=bool)
+        result = skeletonize(image)
+        structure = ndi.generate_binary_structure(3, 3)
+        assert result.any()
+        assert ndi.label(result, structure=structure)[1] == 1
+        # the skeleton stays within the original foreground
+        assert np.all(result <= image)
+
+    def test_even_cube_skeleton(self):
+        # Exact regression test: a filled 16^3 cube is reduced to a single
+        # central voxel instead of vanishing.
+        image = np.ones((16, 16, 16), dtype=bool)
+        result = skeletonize(image)
+        expected = np.zeros_like(image)
+        expected[8, 8, 8] = True
+        assert_array_equal(result, expected)
+
+    def test_solid_object_axis_permutations_and_flips(self):
+        # An asymmetric, simply connected solid: thinning must not disappear
+        # or gain thickness depending on accidental axis order or flips.
+        image = np.zeros((16, 16, 16), dtype=bool)
+        image[2:14, 3:13, 4:12] = True
+        image[10:14, 6:10, 1:4] = True  # protruding arm
+
+        structure = ndi.generate_binary_structure(3, 3)
+        block2x2x2 = np.ones((2, 2, 2), dtype=np.uint8)
+
+        variants = [image]
+        variants += [
+            np.rot90(image, k, axes)
+            for axes in [(0, 1), (0, 2), (1, 2)]
+            for k in (1, 2, 3)
+        ]
+        variants += [np.flip(image, axis) for axis in (0, 1, 2)]
+
+        for variant in variants:
+            result = skeletonize(variant)
+            # non-empty, single connected component, within the foreground
+            assert result.any()
+            assert ndi.label(result, structure=structure)[1] == 1
+            assert np.all(result <= variant)
+            # no 2x2x2 block of foreground: the skeleton stays thin
+            thick = ndi.correlate(
+                result.astype(np.uint8), block2x2x2, mode="constant"
+            )
+            assert thick.max() < 8
+
+    def test_skeletonize_3d_preserves_components(self):
+        # Every connected component of the input must survive thinning,
+        # including solid even-sized ones, and holes must not be filled.
+        structure = ndi.generate_binary_structure(3, 3)
+
+        # two separate filled even-sized cubes
+        image = np.zeros((16, 16, 16), dtype=bool)
+        image[1:5, 1:5, 1:5] = True
+        image[10:14, 10:14, 10:14] = True
+        result = skeletonize(image)
+        assert ndi.label(result, structure=structure)[1] == 2
+
+        # a cube with a straight tunnel through it (genus 1)
+        image = np.ones((16, 16, 16), dtype=bool)
+        image[6:10, 6:10, :] = False
+        result = skeletonize(image)
+        assert result.any()
+        assert ndi.label(result, structure=structure)[1] == 1
+
 
 class TestThin:
     @property

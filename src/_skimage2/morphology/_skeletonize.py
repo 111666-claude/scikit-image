@@ -618,6 +618,10 @@ def _skeletonize_lee(image):
     stops changing. Each iteration consists of two steps: first, a list of
     candidates for removal is assembled; then pixels from this list are
     rechecked sequentially, to better preserve connectivity of the image.
+    During the rechecking, a candidate is never deleted if it has become the
+    last foreground pixel of its connected component in the meantime; this
+    keeps solid, simply connected objects (e.g., filled even-sized cubes)
+    from being eroded away entirely.
 
     The algorithm this function implements is different from the algorithms
     used by either `skeletonize` or `medial_axis`, thus for 2D images the
