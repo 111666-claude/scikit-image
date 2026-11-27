@@ -273,8 +273,11 @@ def phase_cross_correlation(
         the axis order of the input array.
     error : float
         Translation invariant normalized RMS error between
-        ``reference_image`` and ``moving_image``. For masked cross-correlation
-        this error is not available and NaN is returned.
+        ``reference_image`` and ``moving_image``. It is computed with the
+        unnormalized cross-correlation peak (the Fienup metric), independently
+        of ``normalization``; phase normalization only affects the estimated
+        shift and ``phasediff``. For masked cross-correlation this error is
+        not available and NaN is returned.
     phasediff : float
         Global phase difference between the two images (should be
         zero if images are non-negative). For masked cross-correlation
@@ -341,10 +344,16 @@ def phase_cross_correlation(
     shape = src_freq.shape
     image_product = src_freq * target_freq.conj()
     if normalization == "phase":
+        # The RMS error below follows the Fienup normalized RMS definition,
+        # which requires the *unnormalized* cross-correlation. Keep it before
+        # ``image_product`` is phase-normalized for shift / phase estimation.
+        unnormalized_product = image_product.copy()
         eps = np.finfo(image_product.real.dtype).eps
         image_product /= np.maximum(np.abs(image_product), 100 * eps)
     elif normalization is not None:
         raise ValueError("normalization must be either phase or None")
+    else:
+        unnormalized_product = image_product
     cross_correlation = ifftn(image_product)
 
     # Locate maximum
@@ -364,6 +373,12 @@ def phase_cross_correlation(
         target_amp = np.sum(np.real(target_freq * target_freq.conj()))
         target_amp /= target_freq.size
         CCmax = cross_correlation[maxima]
+        if normalization == "phase":
+            # Unnormalized correlation at the estimated peak, on the same
+            # IFFT scale as ``src_amp`` / ``target_amp``.
+            error_CCmax = ifftn(unnormalized_product)[maxima]
+        else:
+            error_CCmax = CCmax
     # If upsampling > 1, then refine estimate with matrix multiply DFT
     else:
         # Initial shift estimate in upsampled grid
@@ -385,6 +400,20 @@ def phase_cross_correlation(
             np.argmax(np.abs(cross_correlation)), cross_correlation.shape
         )
         CCmax = cross_correlation[maxima]
+
+        if normalization == "phase":
+            # Unnormalized DFT at the same subpixel peak and location. The
+            # amplitudes below use the matching raw-sum scaling (no division
+            # by ``src_freq.size``).
+            unnormalized_cross_correlation = _upsampled_dft(
+                unnormalized_product.conj(),
+                upsampled_region_size,
+                upsample_factor,
+                sample_region_offset,
+            ).conj()
+            error_CCmax = unnormalized_cross_correlation[maxima]
+        else:
+            error_CCmax = CCmax
 
         maxima = np.stack(maxima).astype(float_dtype, copy=False)
         maxima -= dftshift
@@ -417,4 +446,8 @@ def phase_cross_correlation(
             "moving_mask=~np.isnan(moving_image))"
         )
 
-    return shift, _compute_error(CCmax, src_amp, target_amp), _compute_phasediff(CCmax)
+    return (
+        shift,
+        _compute_error(error_CCmax, src_amp, target_amp),
+        _compute_phasediff(CCmax),
+    )
