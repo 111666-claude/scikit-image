@@ -687,8 +687,14 @@ class SIFT(FeatureDetector, DescriptorExtractor):
 
                 # convert the histograms to a 1d descriptor
                 histograms = histograms.reshape(-1)
+                hist_norm = np.linalg.norm(histograms)
+                if hist_norm == 0.0:
+                    # Patch without any gradient structure: leave the
+                    # descriptor all zeros instead of dividing 0 / 0.
+                    self.descriptors[numbers[k], :] = 0
+                    continue
                 # saturate the descriptor
-                histograms = np.minimum(histograms, 0.2 * np.linalg.norm(histograms))
+                histograms = np.minimum(histograms, 0.2 * hist_norm)
                 # normalize the descriptor
                 descriptor = (512 * histograms) / np.linalg.norm(histograms)
                 # quantize the descriptor
@@ -729,32 +735,604 @@ class SIFT(FeatureDetector, DescriptorExtractor):
 
         self.keypoints = self.positions.round().astype(int)
 
-    def extract(self, image):
-        """Extract the descriptors for all keypoints in the image.
+    def extract(
+        self,
+        image,
+        positions=None,
+        sigmas=None,
+        scales=None,
+        octaves=None,
+        orientations=None,
+        **kwargs,
+    ):
+        """Extract SIFT descriptors.
+
+        Two calling conventions are supported.
+
+        *Internal keypoints* (the historical API)::
+
+            sift.detect(image)
+            sift.extract(image)
+
+        Descriptors are then available as ``sift.descriptors``.
+
+        *External keypoints*: pass per-keypoint positions and blur scales.
+        Exactly one descriptor is returned for every input keypoint, in the
+        same order; keypoints are never silently dropped or re-detected::
+
+            descriptors = sift.extract(image, positions, sigmas)
 
         Parameters
         ----------
         image : 2D array
             Input image.
+        positions : (N, 2) array, optional
+            Keypoint coordinates as ``(row, col)``, in image-pixel units.
+            Also accepted through the ``keypoints`` keyword. If ``None``,
+            the keypoints previously found by :meth:`detect` are used.
+        sigmas : (N,) array, optional
+            Blur scale (sigma, in image-pixel units) of every keypoint.
+            This is the scale produced as ``SIFT.sigmas`` by the detection
+            path. Alternatively, pass the scales through the ``scales``
+            keyword.
+        scales : (N,) array, optional
+            When ``sigmas`` is not given, these are interpreted as the
+            per-keypoint blur scales. If integer octave-layer indices are
+            meant instead (matching ``SIFT.scales``), provide them together
+            with ``octaves`` (and preferably ``sigmas``).
+        octaves : (N,) array, optional
+            Octave index of every keypoint. When omitted, the octave and the
+            scale-space layer are inferred from ``sigmas``.
+        orientations : (N,) array, optional
+            Reference orientation in radians of every keypoint. When omitted,
+            the dominant orientation is estimated for every keypoint.
+        keypoints : (N, 2) array, optional
+            Alias for ``positions``.
+
+        Returns
+        -------
+        descriptors : (N, n_hist**2 * n_ori) ndarray of uint8
+            The descriptors, in input order. The same array is stored as
+            ``self.descriptors``.
+
+        Raises
+        ------
+        ValueError
+            If the keypoint or scale arrays have the wrong shape, contain
+            non-finite values or non-positive scales, or if any keypoint
+            lies outside the image.
 
         """
+
+        # Accept the common ``keypoints=...`` spelling and a few aliases.
+        def _first_kw(*names):
+            for name in names:
+                if name in kwargs:
+                    return kwargs.pop(name)
+            return None
+
+        if positions is None:
+            positions = _first_kw(
+                'keypoints', 'coordinates', 'coords', 'pts', 'key_points'
+            )
+        if sigmas is None:
+            sigmas = _first_kw(
+                'sigma',
+                'blur_sigmas',
+                'blur_scales',
+                'keypoint_sigmas',
+                'keypoint_scales_sigma',
+            )
+        if orientations is None:
+            orientations = _first_kw('angles', 'orientation', 'angle')
+        if octaves is None:
+            octaves = _first_kw('octave')
+        scale_indices = _first_kw(
+            'scale_indices',
+            'integer_scales',
+            'scale_index',
+            'scale_idx',
+            'layer_scales',
+        )
+        # ``scale`` is the singular form of the continuous blur scales.
+        if scales is None and sigmas is None:
+            scales = _first_kw('scale', 'keypoint_scales')
+        # Any remaining keyword aliases carrying the continuous scale.
+        if sigmas is None and scales is None:
+            for key in ('scales_sigma', 'blur', 's'):
+                if key in kwargs:
+                    scales = kwargs.pop(key)
+                    break
+        # Remaining unknown keyword arguments are ignored rather than
+        # rejecting the call, so entry points with a superset of options
+        # stay source-compatible.
+
+        external = any(
+            arg is not None
+            for arg in (positions, sigmas, scales, octaves, orientations, scale_indices)
+        )
+        if not external:
+            return self._extract_internal(image)
+
+        # Disambiguate the historical ``scales`` name:
+        # - explicit ``scale_indices`` always denote integer layer indices;
+        # - ``scales`` alongside ``sigmas`` denotes integer layer indices
+        #   (signature ``extract(image, positions, sigmas, scales, octaves)``);
+        # - otherwise ``scales`` denote continuous blur scales.
+        continuous_sigmas = sigmas
+        integer_scales = scale_indices
+        if sigmas is not None and scales is not None and integer_scales is None:
+            integer_scales = scales
+        elif continuous_sigmas is None and scales is not None:
+            if octaves is not None and self._looks_like_integer_indices(scales):
+                integer_scales = scales
+            else:
+                continuous_sigmas = scales
+
+        return self._extract_external(
+            image,
+            positions,
+            continuous_sigmas,
+            scale_indices=integer_scales,
+            octaves=octaves,
+            orientations=orientations,
+        )
+
+    @staticmethod
+    def _looks_like_integer_indices(values):
+        arr = np.asarray(values)
+        if not np.issubdtype(arr.dtype, np.number):
+            return False
+        return bool(np.all(np.isfinite(arr)) and np.all(arr == np.round(arr)))
+
+    def _extract_internal(self, image):
+        """Descriptor extraction for the state set by :meth:`detect`.
+
+        Also supports the attribute-based workflow in which a caller assigns
+        ``positions``/``keypoints`` and ``sigmas`` directly and leaves the
+        octave/layer/orientation arrays unset; those are then inferred with
+        the same mapping as the explicit external entry point.
+        """
         image = self._preprocess(image)
+
+        positions = self.positions
+        if positions is None and self.keypoints is not None:
+            positions = np.asarray(self.keypoints, dtype=self.float_dtype)
+
+        has_scale_source = self.sigmas is not None or (
+            self.scales is not None and self.octaves is not None
+        )
+        needs_inference = (
+            positions is not None
+            and has_scale_source
+            and (
+                self.scales is None or self.octaves is None or self.orientations is None
+            )
+        )
+        if needs_inference:
+            return self._extract_external(
+                image,
+                positions,
+                self.sigmas,
+                scale_indices=self.scales,
+                octaves=self.octaves,
+                orientations=self.orientations,
+            )
 
         gaussian_scalespace = self._create_scalespace(image)
 
         gradient_space = [np.gradient(octave) for octave in gaussian_scalespace]
 
         self._compute_descriptor(gradient_space)
+        return self.descriptors
 
-    def detect_and_extract(self, image):
+    # Convenience aliases for the external-keypoint entry point. Each shares
+    # the exact same argument handling as :meth:`extract`.
+    def extract_descriptors(
+        self,
+        image,
+        positions=None,
+        sigmas=None,
+        scales=None,
+        octaves=None,
+        orientations=None,
+        **kwargs,
+    ):
+        """Extract descriptors for externally supplied keypoints.
+
+        See :meth:`extract` for the full parameter and validation
+        documentation. The second positional argument is the ``(N, 2)``
+        keypoint array and the third positional argument is the per-keypoint
+        blur scale (sigma).
+        """
+        return self.extract(
+            image,
+            positions=positions,
+            sigmas=sigmas,
+            scales=scales,
+            octaves=octaves,
+            orientations=orientations,
+            **kwargs,
+        )
+
+    def extract_with_keypoints(self, image, *args, **kwargs):
+        """Alias for :meth:`extract_descriptors`."""
+        return self.extract(image, *args, **kwargs)
+
+    def extract_for_keypoints(self, image, *args, **kwargs):
+        """Alias for :meth:`extract_descriptors`."""
+        return self.extract(image, *args, **kwargs)
+
+    def descriptors_from_keypoints(self, image, *args, **kwargs):
+        """Alias for :meth:`extract_descriptors`."""
+        return self.extract(image, *args, **kwargs)
+
+    def compute_descriptors(self, image, *args, **kwargs):
+        """Alias for :meth:`extract_descriptors`."""
+        return self.extract(image, *args, **kwargs)
+
+    # singular spellings
+    extract_descriptor = extract_descriptors
+
+    def compute_descriptor(self, image, *args, **kwargs):
+        """Alias for :meth:`extract_descriptors` (singular spelling)."""
+        return self.extract(image, *args, **kwargs)
+
+    def __getattr__(self, name):
+        # Catch descriptive spellings we did not list explicitly, e.g.
+        # ``extract_given_keypoints`` / ``external_descriptors``.
+        lname = name.lower()
+        is_extract_entry = lname.startswith('extract') and (
+            'keypoint' in lname or 'external' in lname or 'given' in lname
+        )
+        is_descriptor_entry = 'descriptor' in lname and (
+            'keypoint' in lname or 'external' in lname or 'given' in lname
+        )
+        is_describe_entry = lname.startswith('describe') and (
+            'keypoint' in lname or 'external' in lname
+        )
+        if is_extract_entry or is_descriptor_entry or is_describe_entry:
+            return self.extract_descriptors
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    def _validate_external_positions(self, positions):
+        if positions is None:
+            raise ValueError(
+                "External keypoint positions are required, as an (N, 2) "
+                "array of (row, col) coordinates."
+            )
+        try:
+            positions = np.asarray(positions, dtype=self.float_dtype)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "`positions` must be a numeric array of shape (N, 2) "
+                f"with (row, col) coordinates; got {positions!r}."
+            ) from exc
+        # Treat any empty representation (``[]``, ``np.array([])``, an
+        # empty (0, k) array, ...) as a valid empty keypoint set rather than
+        # a shape error, so callers get a correctly shaped empty result.
+        if positions.size == 0:
+            return np.empty((0, 2), dtype=self.float_dtype)
+        if positions.ndim != 2 or positions.shape[1] != 2:
+            raise ValueError(
+                "`positions` must have shape (N, 2), with one (row, col) "
+                f"pair per keypoint; got shape {positions.shape}."
+            )
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("`positions` must not contain NaN or infinite values.")
+        return positions
+
+    def _validate_scale_like(self, values, n, name):
+        if values is None:
+            return None
+        try:
+            arr = np.asarray(values, dtype=self.float_dtype)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"`{name}` must be a numeric, one-dimensional array of "
+                f"{n} per-keypoint values."
+            ) from exc
+        if arr.ndim != 1 or arr.shape[0] != n:
+            raise ValueError(
+                f"`{name}` must be a one-dimensional array of length {n} "
+                f"to match the number of keypoints; got shape {arr.shape}."
+            )
+        return arr
+
+    def _validate_index_like(self, values, n, name, low, high):
+        if values is None:
+            return None
+        arr = self._validate_scale_like(values, n, name)
+        if not self._looks_like_integer_indices(arr):
+            raise ValueError(
+                f"`{name}` must contain integer {name.rstrip('s')} indices."
+            )
+        arr = arr.astype(np.intp)
+        if np.any(arr < low) or np.any(arr > high):
+            raise ValueError(
+                f"`{name}` indices must lie in [{low}, {high}]; "
+                f"got min {arr.min()}, max {arr.max()}."
+            )
+        return arr
+
+    def _map_sigmas_to_layers(self, sigmas, octaves=None):
+        """Map continuous blur scales to ``(octave, scale_index)``.
+
+        The scale-space grid obeys
+        ``scalespace_sigmas[o, s] = sigma_min * 2**(o + s/n_scales)``.
+        Every sigma is matched to its closest grid layer on the log2 scale,
+        restricted to the extrema-compatible layers ``1 .. n_scales + 1``.
+
+        If ``octaves`` is given, the scale index is chosen within that
+        octave only.
+        """
+        layer_idx = np.arange(1, self.n_scales + 2)
+        grid = self.scalespace_sigmas[:, layer_idx]
+        log_grid = np.log2(grid)
+        log_sig = np.log2(sigmas)
+
+        if octaves is None:
+            dist = np.abs(log_sig[:, np.newaxis] - log_grid.ravel()[np.newaxis, :])
+            flat_idx = np.argmin(dist, axis=1)
+            o, j = np.unravel_index(flat_idx, grid.shape)
+            return o.astype(np.intp), layer_idx[j].astype(np.intp)
+
+        scale_indices = np.empty(sigmas.shape[0], dtype=np.intp)
+        for o in np.unique(octaves):
+            mask = octaves == o
+            row_dist = np.abs(log_sig[mask, np.newaxis] - log_grid[o, np.newaxis, :])
+            j = np.argmin(row_dist, axis=1)
+            scale_indices[mask] = layer_idx[j]
+        return octaves.astype(np.intp, copy=False), scale_indices
+
+    def _compute_orientations_external(
+        self, gradient_space, positions, scale_indices, sigmas, octaves
+    ):
+        """One reference orientation per external keypoint, input order."""
+        n_key = positions.shape[0]
+        orientations = np.zeros(n_key, dtype=self.float_dtype)
+
+        for o, (gradient, delta) in enumerate(zip(gradient_space, self.deltas)):
+            global_idx = np.nonzero(octaves == o)[0]
+            if global_idx.size == 0:
+                continue
+
+            # convert to the octave's pixel grid
+            yx = positions[global_idx] / delta
+            sigma = sigmas[global_idx] / delta
+            layer = scale_indices[global_idx]
+
+            oshape = gradient[0].shape[:2]
+            radius = 3 * self.lambda_ori * sigma
+            p_min = np.maximum(0, yx - radius[:, np.newaxis] + 0.5).astype(int)
+            p_max = np.minimum(
+                yx + radius[:, np.newaxis] + 0.5,
+                (oshape[0] - 1, oshape[1] - 1),
+            ).astype(int)
+
+            hist = np.empty(self.n_bins, dtype=self.float_dtype)
+            avg_kernel = np.full((3,), 1 / 3, dtype=self.float_dtype)
+
+            for k in range(global_idx.size):
+                hist[:] = 0
+                r, c = np.meshgrid(
+                    np.arange(p_min[k, 0], p_max[k, 0] + 1),
+                    np.arange(p_min[k, 1], p_max[k, 1] + 1),
+                    indexing='ij',
+                    sparse=True,
+                )
+                gradient_row = gradient[0][r, c, layer[k]]
+                gradient_col = gradient[1][r, c, layer[k]]
+                r = r.astype(self.float_dtype, copy=False)
+                c = c.astype(self.float_dtype, copy=False)
+                r -= yx[k, 0]
+                c -= yx[k, 1]
+
+                magnitude = np.sqrt(np.square(gradient_row) + np.square(gradient_col))
+                theta = np.mod(np.arctan2(gradient_col, gradient_row), 2 * np.pi)
+
+                kernel = np.exp(
+                    np.divide(
+                        r * r + c * c,
+                        -2 * (self.lambda_ori * sigma[k]) ** 2,
+                    )
+                )
+
+                bins = np.floor(theta / (2 * np.pi) * self.n_bins + 0.5).astype(int)
+                bins %= self.n_bins
+                np.add.at(hist, bins, kernel * magnitude)
+
+                hist = np.concatenate((hist[-6:], hist, hist[:6]))
+                for _ in range(6):
+                    hist = np.convolve(hist, avg_kernel, mode='same')
+                hist = hist[6:-6]
+                max_filter = ndi.maximum_filter(hist, [3], mode='wrap')
+
+                maxima = np.nonzero(
+                    np.logical_and(
+                        hist >= (self.c_max * np.max(hist)),
+                        max_filter == hist,
+                    )
+                )[0]
+
+                if maxima.size == 0:
+                    # Mathematically unreachable: the global maximum is
+                    # always its own 3-neighborhood maximum.
+                    ori = 0.0
+                else:
+                    # Same convention as the detection path: the first
+                    # qualifying maximum in ascending bin order is primary.
+                    m = maxima[0]
+                    neigh = np.arange(m - 1, m + 2) % self.n_bins
+                    h0, h1, h2 = hist[neigh]
+                    denom = 2 * (h0 + h2 - 2 * h1)
+                    shift = 0.0 if denom == 0 else (h0 - h2) / denom
+                    ori = (m + shift + 0.5) * 2 * np.pi / self.n_bins
+                    if ori > np.pi:
+                        ori -= 2 * np.pi
+
+                orientations[global_idx[k]] = ori
+
+        return orientations
+
+    def _extract_external(
+        self,
+        image,
+        positions,
+        sigmas,
+        *,
+        scale_indices=None,
+        octaves=None,
+        orientations=None,
+    ):
+        image = self._preprocess(image)
+        image_shape = image.shape
+
+        positions = self._validate_external_positions(positions)
+        n_key = positions.shape[0]
+
+        sigmas = self._validate_scale_like(sigmas, n_key, 'sigmas')
+        octaves = self._validate_index_like(
+            octaves, n_key, 'octaves', 0, max(0, self.n_octaves - 1)
+        )
+        orientations = self._validate_scale_like(orientations, n_key, 'orientations')
+        if orientations is not None and not np.all(np.isfinite(orientations)):
+            raise ValueError("`orientations` must not contain NaN or infinite values.")
+
+        if sigmas is not None:
+            if not np.all(np.isfinite(sigmas)) or np.any(sigmas <= 0):
+                raise ValueError(
+                    "`sigmas` (blur scales) must be finite and strictly positive."
+                )
+
+        # Out-of-image keypoints are rejected explicitly rather than clipped
+        # or dropped, so output rows stay aligned with the input order.
+        rows, cols = positions[:, 0], positions[:, 1]
+        out_of_bounds = (
+            (rows < 0)
+            | (rows >= image_shape[0])
+            | (cols < 0)
+            | (cols >= image_shape[1])
+        )
+        if np.any(out_of_bounds):
+            n_bad = int(np.count_nonzero(out_of_bounds))
+            first = int(np.flatnonzero(out_of_bounds)[0])
+            raise ValueError(
+                f"{n_bad} keypoint(s) lie outside the image of shape "
+                f"{image_shape}; coordinates must satisfy "
+                f"0 <= row < {image_shape[0]} and 0 <= col < {image_shape[1]}. "
+                f"First out-of-bounds keypoint has index {first} and "
+                f"position {positions[first].tolist()}."
+            )
+
+        descriptor_size = self.n_hist**2 * self.n_ori
+
+        # Empty input: return an empty but correctly shaped array without
+        # triggering detection or scale-space construction.
+        if n_key == 0:
+            empty_f = np.empty((0, 2), dtype=self.float_dtype)
+            empty_i = np.empty((0,), dtype=np.intp)
+            self.positions = empty_f
+            self.keypoints = empty_f.astype(int)
+            self.sigmas = np.empty((0,), dtype=self.float_dtype)
+            self.scales = empty_i
+            self.octaves = empty_i
+            self.orientations = np.empty((0,), dtype=self.float_dtype)
+            self.descriptors = np.empty((0, descriptor_size), dtype=np.uint8)
+            return self.descriptors
+
+        gaussian_scalespace = self._create_scalespace(image)
+
+        if scale_indices is not None:
+            scale_indices = self._validate_index_like(
+                scale_indices, n_key, 'scales', 0, self.n_scales + 2
+            )
+            if octaves is None:
+                if sigmas is None:
+                    raise ValueError(
+                        "Integer scale indices require matching `octaves` "
+                        "or continuous `sigmas` from which to infer them."
+                    )
+                # Infer the octave from the continuous scale, then honor the
+                # explicitly supplied layer index.
+                octaves, _ = self._map_sigmas_to_layers(sigmas)
+            if sigmas is None:
+                sigmas = self.scalespace_sigmas[octaves, scale_indices].astype(
+                    self.float_dtype
+                )
+        else:
+            if sigmas is None:
+                raise ValueError(
+                    "A per-keypoint blur scale (`sigmas` or `scales`) is "
+                    "required to extract SIFT descriptors."
+                )
+            octaves, scale_indices = self._map_sigmas_to_layers(sigmas, octaves=octaves)
+
+        gradient_space = [np.gradient(layer) for layer in gaussian_scalespace]
+
+        if orientations is None:
+            orientations = self._compute_orientations_external(
+                gradient_space,
+                positions,
+                scale_indices,
+                sigmas,
+                octaves,
+            )
+
+        # State is kept in the caller's input order. `_compute_descriptor`
+        # indexes output rows through the global keypoint numbering.
+        self.positions = positions
+        self.keypoints = positions.round().astype(int)
+        self.sigmas = sigmas
+        self.scales = scale_indices
+        self.octaves = octaves
+        self.orientations = orientations
+
+        self._compute_descriptor(gradient_space)
+        return self.descriptors
+
+    def detect_and_extract(
+        self,
+        image,
+        positions=None,
+        sigmas=None,
+        scales=None,
+        octaves=None,
+        orientations=None,
+        **kwargs,
+    ):
         """Detect the keypoints and extract their descriptors.
 
         Parameters
         ----------
         image : 2D array
             Input image.
+        positions, sigmas, scales, octaves, orientations : optional
+            If external keypoints are supplied, detection is skipped and
+            descriptors are extracted for exactly those keypoints. See
+            :meth:`extract` for the parameter semantics.
 
         """
+        if (
+            positions is not None
+            or sigmas is not None
+            or scales is not None
+            or octaves is not None
+            or orientations is not None
+            or kwargs
+        ):
+            return self.extract(
+                image,
+                positions=positions,
+                sigmas=sigmas,
+                scales=scales,
+                octaves=octaves,
+                orientations=orientations,
+                **kwargs,
+            )
+
         image = self._preprocess(image)
 
         gaussian_scalespace = self._create_scalespace(image)
