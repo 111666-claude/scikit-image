@@ -1511,6 +1511,112 @@ def test_extra_properties_table():
     assert out["bbox_list"][1] == [1] * 1
 
 
+# Two regions with areas of 2 and 1 pixels, respectively
+SPACING_SAMPLE = np.array([[1, 1, 0, 2]])
+SPACING_SAMPLE_SPACING = (0.5, 2)
+
+
+def physical_area(regionmask, spacing):
+    """Extra property that requires the pixel spacing."""
+    return np.sum(regionmask) * np.prod(spacing)
+
+
+def weighted_physical_area(regionmask, image_intensity, spacing):
+    """Extra property that requires both intensity image and spacing."""
+    return np.sum(image_intensity[regionmask]) * np.prod(spacing)
+
+
+def too_many_args_with_spacing(regionmask, image_intensity, spacing, superfluous):
+    return 1
+
+
+def test_extra_properties_spacing():
+    regions = regionprops(
+        SPACING_SAMPLE,
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(physical_area,),
+    )
+    assert len(regions) == 2
+    # physical area = pixel count * per-axis spacing product (0.5 * 2 = 1)
+    assert regions[0].physical_area == 2.0
+    assert regions[1].physical_area == 1.0
+
+
+def test_extra_properties_spacing_default():
+    # without `spacing`, isotropic spacing of 1.0 is used
+    regions = regionprops(SPACING_SAMPLE, extra_properties=(physical_area,))
+    assert regions[0].physical_area == 2.0
+    assert regions[1].physical_area == 1.0
+
+
+def test_extra_properties_spacing_per_axis():
+    received = {}
+
+    def spacing_probe(regionmask, spacing):
+        received['spacing'] = spacing
+        return 0
+
+    regions = regionprops(
+        SPACING_SAMPLE,
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(spacing_probe,),
+    )
+    regions[0].spacing_probe
+    assert received['spacing'] == SPACING_SAMPLE_SPACING
+
+
+def test_extra_properties_spacing_not_intensity():
+    # a `spacing` parameter must not be mistaken for the intensity image,
+    # even when no intensity image is provided
+    regions = regionprops(
+        SPACING_SAMPLE,
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(physical_area,),
+    )
+    assert regions[0].physical_area == 2.0
+    # and the intensity image is still passed when both are declared
+    regions = regionprops(
+        SPACING_SAMPLE,
+        intensity_image=SPACING_SAMPLE.astype(float),
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(weighted_physical_area,),
+    )
+    assert regions[0].weighted_physical_area == 2.0
+    assert regions[1].weighted_physical_area == 2.0
+
+
+def test_extra_properties_spacing_table():
+    out = regionprops_table(
+        SPACING_SAMPLE,
+        properties=('label',),
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(physical_area,),
+    )
+    assert_array_equal(out['label'], np.array([1, 2]))
+    assert out['physical_area'].dtype == np.float64
+    assert_array_almost_equal(out['physical_area'], np.array([2.0, 1.0]))
+
+
+def test_extra_properties_spacing_table_empty():
+    out = regionprops_table(
+        np.zeros((4, 4), dtype=int),
+        properties=('label',),
+        spacing=SPACING_SAMPLE_SPACING,
+        extra_properties=(physical_area,),
+    )
+    assert out['label'].shape == (0,)
+    assert out['physical_area'].shape == (0,)
+    assert out['physical_area'].dtype == np.float64
+
+
+def test_extra_properties_spacing_nr_args():
+    with pytest.raises(AttributeError):
+        region = regionprops(
+            SAMPLE, extra_properties=(too_many_args_with_spacing,)
+        )[0]
+        _ = region.too_many_args_with_spacing
+
+
 @pytest.mark.filterwarnings("ignore:`RegionProperties.* is deprecated:FutureWarning")
 @pytest.mark.parametrize("prop_name", [*PROPS.keys(), "custom_intensity_median"])
 def test_multichannel(prop_name):

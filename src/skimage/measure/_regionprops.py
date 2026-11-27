@@ -181,7 +181,41 @@ def _infer_number_of_required_args(func):
     return n_args
 
 
-def _infer_regionprop_dtype(func, *, intensity, ndim):
+def _infer_extra_property_signature(func):
+    """Infer the signature of a custom region property function.
+
+    A custom property function takes the region mask as its first argument
+    and, optionally, the intensity image as its second argument. In addition,
+    it may declare a parameter named ``spacing`` to request the pixel spacing
+    of the region, which is then passed as a keyword argument.
+
+    Parameters
+    ----------
+    func : callable
+        The function that is being inspected.
+
+    Returns
+    -------
+    n_args : int
+        The number of required arguments for `func`, excluding a possible
+        ``spacing`` parameter.
+    needs_spacing : bool
+        Whether `func` declares a parameter named ``spacing``.
+    """
+    argspec = inspect.getfullargspec(func)
+    n_args = len(argspec.args)
+    if argspec.defaults is not None:
+        n_args -= len(argspec.defaults)
+    needs_spacing = 'spacing' in argspec.args or 'spacing' in argspec.kwonlyargs
+    if 'spacing' in argspec.args[:n_args]:
+        # `spacing` is a required positional argument; don't count it towards
+        # the (mask, intensity) signature so it isn't mistaken for the
+        # intensity image.
+        n_args -= 1
+    return n_args, needs_spacing
+
+
+def _infer_regionprop_dtype(func, *, intensity, ndim, spacing=None):
     """Infer the dtype of a region property calculated by `func`.
 
     If a region property function always returns the same shape and type of
@@ -193,10 +227,16 @@ def _infer_regionprop_dtype(func, *, intensity, ndim):
     func : callable
         Function to be tested. The signature should be array[bool] -> Any if
         `intensity` is False, or *(array[bool], array[float]) -> Any otherwise.
+        In addition, `func` may declare a parameter named ``spacing`` to
+        request the pixel spacing, which is then passed as a keyword argument.
     intensity : bool
         Whether the regionprop is calculated using an intensity image.
     ndim : int
         The number of dimensions for which to check `func`.
+    spacing : tuple of float, shape (ndim,), optional
+        The pixel spacing along each axis of the image, passed to `func` if
+        it declares a ``spacing`` parameter. Defaults to isotropic spacing
+        of 1.0 along each axis.
 
     Returns
     -------
@@ -211,13 +251,23 @@ def _infer_regionprop_dtype(func, *, intensity, ndim):
 
     rng = np.random.default_rng()
 
-    if intensity and _infer_number_of_required_args(func) == 2:
+    n_args, needs_spacing = _infer_extra_property_signature(func)
+    kwargs = {}
+    if needs_spacing:
+        if spacing is None:
+            spacing = np.full(ndim, 1.0)
+        kwargs['spacing'] = tuple(spacing)
+
+    if intensity and n_args == 2:
 
         def _func(mask):
-            return func(mask, rng.random(mask.shape))
+            return func(mask, rng.random(mask.shape), **kwargs)
 
     else:
-        _func = func
+
+        def _func(mask):
+            return func(mask, **kwargs)
+
     props1, props2 = map(_func, propmasks)
     if (
         np.isscalar(props1)
@@ -395,28 +445,32 @@ class RegionProperties:
             )
         if attr in self._extra_properties:
             func = self._extra_properties[attr]
-            n_args = _infer_number_of_required_args(func)
+            n_args, needs_spacing = _infer_extra_property_signature(func)
+            kwargs = {}
+            if needs_spacing:
+                kwargs['spacing'] = tuple(self._spacing)
             # determine whether func requires intensity image
             if n_args == 2:
                 if self._intensity_image is not None:
                     if self._multichannel:
                         multichannel_list = [
-                            func(self.image, self.image_intensity[..., i])
+                            func(self.image, self.image_intensity[..., i], **kwargs)
                             for i in range(self.image_intensity.shape[-1])
                         ]
                         return np.stack(multichannel_list, axis=-1)
                     else:
-                        return func(self.image, self.image_intensity)
+                        return func(self.image, self.image_intensity, **kwargs)
                 else:
                     raise AttributeError(
                         f'intensity image required to calculate {attr}'
                     )
             elif n_args == 1:
-                return func(self.image)
+                return func(self.image, **kwargs)
             else:
                 raise AttributeError(
                     f'Custom regionprop function\'s number of arguments must '
-                    f'be 1 or 2, but {attr} takes {n_args} arguments.'
+                    f'be 1 or 2 (excluding an optional `spacing` parameter), '
+                    f'but {attr} takes {n_args} arguments.'
                 )
         elif attr in PROPS and attr.lower() == attr:
             if (
@@ -936,6 +990,7 @@ def _props_to_dict(regions, properties=('label', 'bbox'), separator='-'):
                 func,
                 intensity=r._intensity_image is not None,
                 ndim=r.image.ndim,
+                spacing=r._spacing,
             )
 
         # scalars and objects are dedicated one column per prop
@@ -1035,7 +1090,10 @@ def regionprops_table(
         property the extra property will not be visible and a UserWarning is
         issued. A property computation function must take a region mask as its
         first argument. If the property requires an intensity image, it must
-        accept the intensity image as the second argument.
+        accept the intensity image as the second argument. If the property
+        requires the pixel spacing, it must declare a parameter named
+        ``spacing``, which will receive the spacing along each axis as a
+        keyword argument.
     spacing : tuple of float, shape (ndim,)
         The pixel spacing along each axis of the image.
 
@@ -1206,7 +1264,10 @@ def regionprops(
         property, the extra property will not be visible and a UserWarning will be
         issued. A property computation function must take `label_image` as its
         first argument. If the property requires an intensity image, it must
-        accept `intensity_image` as the second argument.
+        accept `intensity_image` as the second argument. If the property
+        requires the pixel spacing, it must declare a parameter named
+        ``spacing``, which will receive the spacing along each axis as a
+        keyword argument.
     spacing : tuple of float, shape (ndim,)
         The pixel spacing along each axis of the image.
     offset : array-like of int, shape `(label_image.ndim,)`, optional
