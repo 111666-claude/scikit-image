@@ -463,6 +463,149 @@ def test_resize_clip(order, preserve_range, anti_aliasing, dtype):
     assert np.nanmax(resized) == expected_max
 
 
+@pytest.mark.parametrize('channel_axis', [0, 1, 2, -1, -2, -3])
+def test_resize_channel_axis(channel_axis):
+    # output_shape describes spatial dimensions only; the channel axis keeps
+    # its original position and length
+    x = np.random.default_rng(0).normal(size=(5, 7, 3))
+    x = np.moveaxis(x, -1, channel_axis)
+    resized = resize(
+        x,
+        (10, 14),
+        order=1,
+        channel_axis=channel_axis,
+        anti_aliasing=False,
+        mode='constant',
+    )
+    expected_shape = list(x.shape)
+    expected_shape[channel_axis] = 3
+    spatial_positions = [i for i in range(3) if i != channel_axis % 3]
+    expected_shape[spatial_positions[0]] = 10
+    expected_shape[spatial_positions[1]] = 14
+    assert resized.shape == tuple(expected_shape)
+
+    # reference: move channels to the last axis, use the legacy interface
+    # (output_shape including the channel length), then move the axis back
+    x_last = np.moveaxis(x, channel_axis, -1)
+    ref = resize(
+        x_last,
+        (10, 14, 3),
+        order=1,
+        anti_aliasing=False,
+        mode='constant',
+    )
+    ref = np.moveaxis(ref, -1, channel_axis)
+    assert_allclose(resized, ref)
+
+
+def test_resize_channel_axis_fixed_shape():
+    # fixed channel-first (3, 5, 7) image resized to spatial (10, 14)
+    x = np.random.default_rng(42).normal(size=(3, 5, 7))
+    resized = resize(x, (10, 14), order=1, channel_axis=0, anti_aliasing=False)
+    ref = np.moveaxis(
+        resize(
+            np.moveaxis(x, 0, -1),
+            (10, 14, 3),
+            order=1,
+            anti_aliasing=False,
+        ),
+        -1,
+        0,
+    )
+    assert resized.shape == (3, 10, 14)
+    assert_allclose(resized, ref)
+
+
+def test_resize_channel_axis_negative():
+    x = np.random.default_rng(1).normal(size=(3, 5, 7))
+    resized = resize(x, (10, 14), channel_axis=-3, anti_aliasing=False)
+    ref = resize(x, (10, 14), channel_axis=0, anti_aliasing=False)
+    assert resized.shape == (3, 10, 14)
+    assert_allclose(resized, ref)
+
+
+def test_resize_channel_axis_single_channel():
+    # a length-one channel axis behaves like the grayscale image
+    x = np.random.default_rng(2).normal(size=(1, 5, 7))
+    resized = resize(x, (10, 14), channel_axis=0, anti_aliasing=False)
+    assert resized.shape == (1, 10, 14)
+    assert_allclose(resized[0], resize(x[0], (10, 14), anti_aliasing=False))
+
+
+def test_resize_channel_axis_integer():
+    # dtype rules are independent of the channel layout
+    x = np.random.default_rng(3).integers(0, 255, size=(3, 5, 7), dtype=np.uint8)
+    resized_0 = resize(x, (10, 14), order=0, channel_axis=0, anti_aliasing=False)
+    assert resized_0.dtype == np.uint8
+    assert resized_0.shape == (3, 10, 14)
+    resized_1 = resize(x, (10, 14), order=1, channel_axis=0)
+    assert resized_1.dtype == np.float64
+
+
+def test_resize_channel_axis_no_color_mixing():
+    # interpolation and anti-aliasing must operate per channel; give the
+    # channels disjoint constant values and check they stay unchanged
+    x = np.stack(
+        [np.full((5, 7), 0.0), np.full((5, 7), 5.0), np.full((5, 7), 9.0)],
+        axis=0,
+    )
+    resized = resize(x, (3, 4), order=1, channel_axis=0)
+    for channel, value in enumerate([0.0, 5.0, 9.0]):
+        assert_allclose(resized[channel], np.full((3, 4), value))
+
+    # explicit per-spatial-axis sigma and a full-length sigma tuple alike
+    # must not smooth along the channel axis
+    resized_s = resize(
+        x, (3, 4), order=1, channel_axis=0, anti_aliasing_sigma=(1.0, 1.0)
+    )
+    for channel, value in enumerate([0.0, 5.0, 9.0]):
+        assert_allclose(resized_s[channel], np.full((3, 4), value))
+    resized_full_sigma = resize(
+        x,
+        (3, 4),
+        order=1,
+        channel_axis=0,
+        anti_aliasing_sigma=(1.0, 1.0, 100.0),
+    )
+    for channel, value in enumerate([0.0, 5.0, 9.0]):
+        assert_allclose(resized_full_sigma[channel], np.full((3, 4), value))
+
+
+def test_resize_channel_axis_invalid():
+    x = np.zeros((3, 5, 7))
+    # output_shape must cover the spatial dimensions only
+    with pytest.raises(ValueError):
+        resize(x, (10, 14, 3), channel_axis=0)
+    with pytest.raises(ValueError):
+        resize(x, (10,), channel_axis=0)
+    # out-of-range channel axes (positive and negative)
+    with pytest.raises(ValueError):
+        resize(x, (10, 14), channel_axis=3)
+    with pytest.raises(ValueError):
+        resize(x, (10, 14), channel_axis=-4)
+    # anti_aliasing_sigma must be scalar or have one entry per spatial axis
+    with pytest.raises(ValueError):
+        resize(
+            x,
+            (3, 4),
+            order=1,
+            channel_axis=0,
+            anti_aliasing_sigma=(1.0, 2.0, 3.0, 4.0),
+        )
+    # the channel axis has to be an integer
+    with pytest.raises(TypeError):
+        resize(x, (10, 14), channel_axis=0.5)
+    # a scalar sigma broadcasts over the spatial axes and keeps the shape
+    resized_scalar_sigma = resize(
+        x,
+        (3, 4),
+        order=1,
+        channel_axis=0,
+        anti_aliasing_sigma=0.5,
+    )
+    assert resized_scalar_sigma.shape == (3, 3, 4)
+
+
 @pytest.mark.parametrize('dtype', [np.float16, np.float32, np.float64])
 def test_swirl(dtype):
     image = img_as_float(checkerboard()).astype(dtype, copy=False)

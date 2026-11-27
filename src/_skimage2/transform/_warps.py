@@ -77,6 +77,8 @@ def resize(
     preserve_range=False,
     anti_aliasing=None,
     anti_aliasing_sigma=None,
+    *,
+    channel_axis=None,
 ):
     """Resize image to match a certain size.
 
@@ -94,6 +96,10 @@ def resize(
         `dim` is not provided, the number of channels is preserved. In case the
         number of input channels does not equal the number of output channels a
         n-dimensional interpolation is applied.
+
+        When `channel_axis` is given, `output_shape` only describes the
+        spatial dimensions (it must have length ``image.ndim - 1``); the
+        channel dimension is preserved and must not be included.
 
     Returns
     -------
@@ -132,6 +138,16 @@ def resize(
         By default, this value is chosen as (s - 1) / 2 where s is the
         downsampling factor, where s > 1. For the up-size case, s < 1, no
         anti-aliasing is performed prior to rescaling.
+    channel_axis : int or None, optional
+        If None, the image is assumed to be a grayscale (single channel)
+        image. Otherwise, this parameter indicates which axis of the array
+        corresponds to channels. Interpolation and anti-aliasing are applied
+        independently to each channel, i.e. the channels are never mixed. The
+        channel axis is kept at its original position in the output and its
+        length is unchanged. Negative values are counted from the last axis.
+
+        When this parameter is given, `output_shape` must contain one entry
+        per spatial axis only (its length must be ``image.ndim - 1``).
 
     See Also
     --------
@@ -165,9 +181,42 @@ def resize(
     >>> resize(image, (100, 100)).shape
     (100, 100)
 
+    Channel-first images keep their channel axis at the same position:
+
+    >>> image = np.zeros((3, 5, 7))
+    >>> resized = resize(image, (10, 14), channel_axis=0)
+    >>> resized.shape
+    (3, 10, 14)
+
     """
 
-    image, output_shape = _preprocess_resize_output_shape(image, output_shape)
+    if channel_axis is not None:
+        if channel_axis < -image.ndim or channel_axis >= image.ndim:
+            raise ValueError(
+                f"channel_axis {channel_axis} is out of range for an image "
+                f"with {image.ndim} dimensions"
+            )
+        # Move the channel axis to the last position. The core of this
+        # function only treats the trailing axis as a potential channel axis,
+        # so this makes the spatial rescaling independent of the channel
+        # layout. The axis is moved back to its original position at the end.
+        channel_axis = channel_axis % image.ndim
+        image = np.moveaxis(image, channel_axis, -1)
+        n_channels = image.shape[-1]
+
+        output_shape = tuple(output_shape)
+        if len(output_shape) != image.ndim - 1:
+            raise ValueError(
+                "When channel_axis is specified, output_shape must describe "
+                f"the {image.ndim - 1} spatial dimension(s) only, but got "
+                f"{len(output_shape)} value(s): {output_shape}"
+            )
+        # Keep the channel dimension at its original length.
+        output_shape = output_shape + (n_channels,)
+    else:
+        image, output_shape = _preprocess_resize_output_shape(image, output_shape)
+        channel_axis = None
+
     input_shape = image.shape
     input_type = image.dtype
 
@@ -189,21 +238,49 @@ def resize(
     if order > 0:
         image = convert_to_float(image, preserve_range)
 
+    # Validate and normalize an explicitly supplied anti-aliasing sigma
+    # independently of whether anti-aliasing ends up enabled, so that an
+    # invalid shape always raises a clear error.
+    if anti_aliasing_sigma is not None:
+        anti_aliasing_sigma = np.atleast_1d(anti_aliasing_sigma)
+        if channel_axis is not None and anti_aliasing_sigma.shape == (
+            len(factors) - 1,
+        ):
+            # spatial sigmas only; append a placeholder for the channel
+            # axis, which is forced to zero below
+            anti_aliasing_sigma = np.concatenate((anti_aliasing_sigma, [0.0]))
+        if (
+            anti_aliasing_sigma.shape != factors.shape
+            and not np.broadcast_shapes(anti_aliasing_sigma.shape, factors.shape)
+            == factors.shape
+        ):
+            n_spatial = len(factors) - 1 if channel_axis is not None else len(factors)
+            raise ValueError(
+                "anti_aliasing_sigma must be a scalar or contain one "
+                f"value per spatial axis ({n_spatial}); got "
+                f"{len(anti_aliasing_sigma)} value(s)"
+            )
+
     # Translate modes used by np.pad to those used by scipy.ndimage
     ndi_mode = _to_ndimage_mode(mode)
     if anti_aliasing:
         if anti_aliasing_sigma is None:
             anti_aliasing_sigma = np.maximum(0, (factors - 1) / 2)
         else:
-            anti_aliasing_sigma = np.atleast_1d(anti_aliasing_sigma) * np.ones_like(
-                factors
-            )
+            anti_aliasing_sigma = anti_aliasing_sigma * np.ones_like(factors)
             if np.any(anti_aliasing_sigma < 0):
                 raise ValueError(
                     "Anti-aliasing standard deviation must be "
                     "greater than or equal to zero"
                 )
-            elif np.any((anti_aliasing_sigma > 0) & (factors <= 1)):
+            if channel_axis is not None:
+                # Never smooth across channels: filtering along the channel
+                # axis would mix the colors of adjacent channels. Zero the
+                # entry before the warning check below so a user-supplied
+                # value for the channel axis cannot trigger a spurious
+                # warning (it is ignored regardless).
+                anti_aliasing_sigma[-1] = 0
+            if np.any((anti_aliasing_sigma > 0) & (factors <= 1)):
                 warn(
                     "Anti-aliasing standard deviation greater than zero but "
                     "not down-sampling along all axes"
@@ -220,6 +297,10 @@ def resize(
     )
 
     _clip_warp_output(image, out, mode, cval, clip)
+
+    if channel_axis is not None:
+        # restore the channel axis to its original position
+        out = np.moveaxis(out, -1, channel_axis)
 
     return out
 
