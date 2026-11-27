@@ -340,7 +340,8 @@ cdef inline np_real_numeric get_pixel3d(np_real_numeric* image,
         Pixel value at given position.
     """
     if mode == b'C':
-        if (r < 0) or (r >= rows) or (c < 0) or (c >= cols):
+        if (r < 0) or (r >= rows) or (c < 0) or (c >= cols) \
+                or (d < 0) or (d >= dims):
             return cval
         else:
             return image[r * cols * dims + c * dims + d]

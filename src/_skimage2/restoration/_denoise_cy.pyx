@@ -5,7 +5,7 @@
 
 cimport numpy as cnp
 import numpy as np
-from libc.math cimport sqrt
+from libc.math cimport fabs, sqrt
 from libc.float cimport DBL_MAX
 from _skimage2._shared.interpolation cimport get_pixel3d
 from _skimage2._shared.fused_numerics cimport np_floats
@@ -94,6 +94,75 @@ def _denoise_bilateral(const np_floats[:, :, ::1] image, cnp.float64_t max_value
                     out[r, c, d] = total_values[d] / total_weight
 
     return np.squeeze(np.asarray(out))
+
+
+def _denoise_bilateral_3d(const np_floats[:, :, ::1] volume,
+                          cnp.float64_t max_value, Py_ssize_t win_size,
+                          cnp.float64_t sigma_color,
+                          cnp.float64_t sigma_spatial, Py_ssize_t bins, mode,
+                          cnp.float64_t cval, np_floats[::1] color_lut,
+                          np_floats[::1] range_lut,
+                          np_floats[:, :, ::1] out):
+    """Bilateral filter for 3D grayscale volumes.
+
+    The spatial closeness is measured in all three spatial axes and the
+    radiometric similarity uses the single (grayscale) intensity channel.
+    """
+    cdef:
+        Py_ssize_t planes = volume.shape[0]
+        Py_ssize_t rows = volume.shape[1]
+        Py_ssize_t cols = volume.shape[2]
+        Py_ssize_t window_ext = (win_size - 1) / 2
+        Py_ssize_t max_color_lut_bin = bins - 1
+
+        Py_ssize_t p, r, c, wp, wr, wc, kp, kr, kc, pp, rr, cc, color_lut_bin
+        np_floats centre, value, weight, dist, total_weight, color_weight, \
+               range_weight, total_value
+        np_floats dist_scale
+
+    if mode not in ('constant', 'wrap', 'symmetric', 'reflect', 'edge'):
+        raise ValueError("Invalid mode specified.  Please use `constant`, "
+                         "`edge`, `wrap`, `symmetric` or `reflect`.")
+    cdef char cmode = ord(mode[0].upper())
+
+    dist_scale = bins / max_value
+
+    with nogil:
+        for p in range(planes):
+            for r in range(rows):
+                for c in range(cols):
+                    total_weight = 0
+                    total_value = 0
+                    centre = volume[p, r, c]
+                    for wp in range(-window_ext, window_ext + 1):
+                        pp = wp + p
+                        kp = wp + window_ext
+                        for wr in range(-window_ext, window_ext + 1):
+                            rr = wr + r
+                            kr = wr + window_ext
+                            for wc in range(-window_ext, window_ext + 1):
+                                cc = wc + c
+                                kc = wc + window_ext
+
+                                value = get_pixel3d(&volume[0, 0, 0], planes,
+                                                    rows, cols, pp, rr, cc,
+                                                    cmode, cval)
+                                dist = fabs(centre - value)
+
+                                range_weight = range_lut[
+                                    (kp * win_size + kr) * win_size + kc]
+
+                                color_lut_bin = Py_ssize_t_min(
+                                    <Py_ssize_t>(dist * dist_scale),
+                                    max_color_lut_bin)
+                                color_weight = color_lut[color_lut_bin]
+
+                                weight = range_weight * color_weight
+                                total_value += value * weight
+                                total_weight += weight
+                    out[p, r, c] = total_value / total_weight
+
+    return np.asarray(out)
 
 
 def _denoise_tv_bregman(const np_floats[:, :, ::1] image, np_floats weight,

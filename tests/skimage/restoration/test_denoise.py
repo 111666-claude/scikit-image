@@ -349,8 +349,114 @@ def test_denoise_bilateral_color(channel_axis):
 
 def test_denoise_bilateral_3d_grayscale():
     img = np.ones((50, 50, 3))
+    # 3D grayscale volumes are supported when channel_axis is None
+    result = restoration.denoise_bilateral(img, channel_axis=None)
+    assert_array_equal(result, img)
+
+
+def test_denoise_bilateral_3d_grayscale_shape():
+    rng = np.random.RandomState(1923847)
+    img = rng.rand(10, 12, 14)
+    out = restoration.denoise_bilateral(
+        img, sigma_color=0.1, sigma_spatial=2, channel_axis=None
+    )
+    assert out.shape == img.shape
+
+
+def test_denoise_bilateral_3d_grayscale_constant():
+    img = np.ones((8, 9, 10)) * 0.5
+    out = restoration.denoise_bilateral(img, channel_axis=None)
+    assert_array_equal(out, img)
+
+
+def test_denoise_bilateral_3d_grayscale_impulse():
+    # An isolated impulse is suppressed more strongly as sigma_color grows
+    img = np.zeros((9, 9, 9))
+    img[4, 4, 4] = 1.0
+    out_small = restoration.denoise_bilateral(
+        img, sigma_color=0.1, sigma_spatial=1, channel_axis=None
+    )
+    out_large = restoration.denoise_bilateral(
+        img, sigma_color=1.0, sigma_spatial=1, channel_axis=None
+    )
+    # impulse is preserved for small sigma_color ...
+    assert out_small[4, 4, 4] > 0.9
+    # ... and increasingly suppressed for larger sigma_color
+    assert out_large[4, 4, 4] < out_small[4, 4, 4]
+    # the zero neighborhood stays near zero in both cases
+    assert out_small[0, 0, 0] < 0.1
+    assert out_large[0, 0, 0] < 0.1
+
+
+def test_denoise_bilateral_3d_grayscale_weighted_sum():
+    # Check the filtered value of the center voxel against a hand-computed
+    # bilateral weighted sum on a small voxel block.
+    rng = np.random.RandomState(48151623)
+    img = rng.rand(5, 5, 5)
+    win_size = 3
+    sigma_color = 0.2
+    sigma_spatial = 1.5
+    bins = 10000
+    out = restoration.denoise_bilateral(
+        img,
+        win_size=win_size,
+        sigma_color=sigma_color,
+        sigma_spatial=sigma_spatial,
+        bins=bins,
+        channel_axis=None,
+    )
+
+    # hand-computed weighted sum for the center voxel (mode='constant',
+    # cval=0 is irrelevant here since the window lies inside the volume);
+    # the color distance is quantized into `bins` bins exactly as done by
+    # the lookup table used internally
+    center = (2, 2, 2)
+    max_value = img.max()
+    total_value = 0.0
+    total_weight = 0.0
+    for dp in range(-1, 2):
+        for dr in range(-1, 2):
+            for dc in range(-1, 2):
+                value = img[center[0] + dp, center[1] + dr, center[2] + dc]
+                spatial_dist = np.sqrt(dp**2 + dr**2 + dc**2)
+                range_weight = np.exp(-0.5 * (spatial_dist / sigma_spatial) ** 2)
+                color_dist = abs(img[center] - value)
+                lut_bin = min(int(color_dist * bins / max_value), bins - 1)
+                quantized_dist = lut_bin * max_value / bins
+                color_weight = np.exp(-0.5 * (quantized_dist / sigma_color) ** 2)
+                weight = range_weight * color_weight
+                total_value += value * weight
+                total_weight += weight
+    expected = total_value / total_weight
+    assert abs(out[center] - expected) < 1e-6
+
+
+@pytest.mark.parametrize('mode', ['constant', 'edge', 'symmetric', 'reflect', 'wrap'])
+def test_denoise_bilateral_3d_grayscale_modes(mode):
+    rng = np.random.RandomState(27182818)
+    img = rng.rand(6, 7, 8)
+    out = restoration.denoise_bilateral(
+        img, sigma_color=0.1, sigma_spatial=1, mode=mode, channel_axis=None
+    )
+    assert out.shape == img.shape
+    assert np.all(np.isfinite(out))
+
+
+def test_denoise_bilateral_3d_grayscale_invalid_mode():
+    img = np.random.RandomState(31415926).rand(5, 5, 5)
     with pytest.raises(ValueError):
-        restoration.denoise_bilateral(img, channel_axis=None)
+        restoration.denoise_bilateral(img, mode='invalid', channel_axis=None)
+
+
+def test_denoise_bilateral_3d_grayscale_negative():
+    # offset invariance also holds for 3D grayscale volumes
+    img = np.ones((10, 10, 10))
+    img[2, 2, 2] = 2
+
+    out1 = restoration.denoise_bilateral(img, channel_axis=None)
+    out2 = restoration.denoise_bilateral(img - 10, channel_axis=None)
+
+    assert_array_almost_equal(out1, out2 + 10)
 
 
 def test_denoise_bilateral_3d_multichannel():

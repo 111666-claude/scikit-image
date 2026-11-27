@@ -9,7 +9,11 @@ from ..util.dtype import img_as_float
 from _skimage2._shared import utils
 from _skimage2._shared.utils import _supported_float_type, warn
 from _skimage2._shared.version_requirements import require
-from ._denoise_cy import _denoise_bilateral, _denoise_tv_bregman
+from ._denoise_cy import (
+    _denoise_bilateral,
+    _denoise_bilateral_3d,
+    _denoise_tv_bregman,
+)
 from ..color.colorconv import rgb2ycbcr, ycbcr2rgb, ycbcr_from_rgb
 
 
@@ -64,7 +68,7 @@ def _compute_color_lut(bins, sigma, max_value, *, dtype=float):
     return _gaussian_weight(values, sigma**2, dtype=dtype)
 
 
-def _compute_spatial_lut(win_size, sigma, *, dtype=float):
+def _compute_spatial_lut(win_size, sigma, *, dtype=float, ndim=2):
     """Helping function. Define a lookup table containing Gaussian filter
     values using the spatial sigma.
 
@@ -79,15 +83,34 @@ def _compute_spatial_lut(win_size, sigma, *, dtype=float):
         averaging of pixels with larger spatial differences.
     dtype : data type object
         The type and size of the data to be returned.
+    ndim : int, optional
+        Number of spatial dimensions the lookup table is computed for
+        (2 for images, 3 for volumes).
 
     Returns
     -------
     spatial_lut : ndarray
         Lookup table for the spatial sigma.
+
+    Notes
+    -----
+    For ``ndim=2`` the historical grid of ``win_size + 1`` points per axis
+    is kept for backward compatibility with the 2D filtering kernel, which
+    indexes the lookup table with a stride of ``win_size``. For ``ndim=3``
+    the correct symmetric grid of ``win_size`` points per axis is used.
     """
-    grid_points = np.arange(-win_size // 2, win_size // 2 + 1)
-    rr, cc = np.meshgrid(grid_points, grid_points, indexing='ij')
-    distances = np.hypot(rr, cc)
+    if ndim == 2:
+        grid_points = np.arange(-win_size // 2, win_size // 2 + 1)
+        rr, cc = np.meshgrid(grid_points, grid_points, indexing='ij')
+        distances = np.hypot(rr, cc)
+    else:
+        half_window = win_size // 2
+        grid_points = np.arange(-half_window, half_window + 1)
+        grids = np.meshgrid(*([grid_points] * ndim), indexing='ij')
+        dist_squared = grids[0] ** 2
+        for grid in grids[1:]:
+            dist_squared = dist_squared + grid**2
+        distances = np.sqrt(dist_squared)
     return _gaussian_weight(distances, sigma**2, dtype=dtype).ravel()
 
 
@@ -107,8 +130,8 @@ def denoise_bilateral(
 
     Parameters
     ----------
-    image : ndarray, shape (M, N[, 3])
-        Input image, 2D grayscale or RGB.
+    image : ndarray, shape (M, N) or (M, N, P) or (M, N, 3)
+        Input image, 2D or 3D grayscale, or 2D RGB.
     win_size : int
         Window size for filtering.
         If win_size is not specified, it is calculated as
@@ -150,7 +173,8 @@ def denoise_bilateral(
 
     Spatial closeness is measured by the Gaussian function of the Euclidean
     distance between two pixels and a certain standard deviation
-    (`sigma_spatial`).
+    (`sigma_spatial`). For 3D grayscale volumes, the Euclidean distance is
+    computed across all three spatial axes.
 
     Radiometric similarity is measured by the Gaussian function of the
     Euclidean distance between two color values and a certain standard
@@ -163,6 +187,9 @@ def denoise_bilateral(
     For more information on scikit-image's data type conversions and how
     images are rescaled in these conversions,
     see: https://scikit-image.org/docs/stable/user_guide/data_types.html.
+
+    .. versionchanged:: 0.26
+       3D grayscale volumes are now supported when ``channel_axis=None``.
 
     References
     ----------
@@ -193,7 +220,8 @@ def denoise_bilateral(
             else:
                 raise ValueError(
                     f'Bilateral filter is only implemented for '
-                    f'2D grayscale images (image.ndim == 2) and '
+                    f'2D grayscale images (image.ndim == 2), '
+                    f'3D grayscale volumes (image.ndim == 3) and '
                     f'2D multichannel (image.ndim == 3) images, '
                     f'but the input image has {image.ndim} dimensions.'
                 )
@@ -214,12 +242,16 @@ def denoise_bilateral(
                 )
                 warn(msg)
     else:
-        if image.ndim > 2:
+        if image.ndim > 3:
             raise ValueError(
                 f'Bilateral filter is not implemented for '
-                f'grayscale images of 3 or more dimensions, '
-                f'but input image has {image.shape} shape. Use '
-                f'``channel_axis=-1`` for 2D RGB images.'
+                f'grayscale images of 4 or more dimensions, '
+                f'but input image has {image.shape} shape.'
+            )
+        elif image.ndim < 2:
+            raise ValueError(
+                f'Bilateral filter requires a 2D or 3D grayscale image, '
+                f'but input image has {image.shape} shape.'
             )
 
     if win_size is None:
@@ -234,6 +266,41 @@ def denoise_bilateral(
     # if image.max() is 0, then dist_scale can have an unverified value
     # and color_lut[<int>(dist * dist_scale)] may cause a segmentation fault
     # so we verify we have a positive image and that the max is not 0.0.
+
+    if channel_axis is None and image.ndim == 3:
+        # 3D grayscale volume
+        image = np.ascontiguousarray(img_as_float(image))
+
+        sigma_color = sigma_color or image.std()
+
+        color_lut = _compute_color_lut(
+            bins, sigma_color, max_value, dtype=image.dtype
+        )
+        range_lut = _compute_spatial_lut(
+            win_size, sigma_spatial, dtype=image.dtype, ndim=3
+        )
+
+        out = np.empty(image.shape, dtype=image.dtype)
+
+        if min_value < 0:
+            image = image - min_value
+            max_value -= min_value
+        _denoise_bilateral_3d(
+            image,
+            max_value,
+            win_size,
+            sigma_color,
+            sigma_spatial,
+            bins,
+            mode,
+            cval,
+            color_lut,
+            range_lut,
+            out,
+        )
+        if min_value < 0:
+            out += min_value
+        return out
 
     image = np.atleast_3d(img_as_float(image))
     image = np.ascontiguousarray(image)

@@ -8,6 +8,7 @@ New Features
 
 - Add a warning when importing experimental skimage2 (`#7873 <https://github.com/scikit-image/scikit-image/pull/7873>`_).
 - In ``skimage.feature``, add a new parameter ``prescale`` to the functions  ``blob_doh``, blob_dog``, and ``blob_log``. This parameter controls the internal rescaling behavior which makes it easier to set the ``threshold`` parameter  correctly (`#7858 <https://github.com/scikit-image/scikit-image/pull/7858>`_).
+- In ``skimage.restoration.denoise_bilateral``, support 3D grayscale volumes when ``channel_axis=None``. Spatial closeness is computed across all three spatial axes.
 
 API Changes
 -----------
