@@ -1,7 +1,6 @@
 import networkx as nx
 import numpy as np
 from scipy import ndimage as ndi
-from scipy import sparse
 import math
 
 from ..measure._regionprops import regionprops
@@ -430,31 +429,119 @@ def rag_boundary(labels, edge_map, connectivity=2):
 
     """
 
-    conn = ndi.generate_binary_structure(labels.ndim, connectivity)
-    eroded = ndi.grey_erosion(labels, footprint=conn)
-    dilated = ndi.grey_dilation(labels, footprint=conn)
-    boundaries0 = eroded != labels
-    boundaries1 = dilated != labels
-    labels_small = np.concatenate((eroded[boundaries0], labels[boundaries1]))
-    labels_large = np.concatenate((labels[boundaries0], dilated[boundaries1]))
-    n = np.max(labels_large) + 1
+    labels = np.asarray(labels)
+    edge_map = np.asarray(edge_map)
 
-    # use a dummy broadcast array as data for RAG
-    ones = np.broadcast_to(1.0, labels_small.shape)
-    count_matrix = sparse.csr_array(
-        (ones, (labels_small, labels_large)), dtype=int, shape=(n, n)
-    )
-    data = np.concatenate((edge_map[boundaries0], edge_map[boundaries1]))
+    # The footprint defines true pixel adjacency, exactly as in ``RAG``.
+    footprint = ndi.generate_binary_structure(labels.ndim, connectivity)
 
-    graph_matrix = sparse.csr_array((data, (labels_small, labels_large)))
-    graph_matrix.data /= count_matrix.data
+    # Use a signed 64-bit working copy so label comparisons never depend on
+    # unsigned wraparound. The input array is never modified.
+    labels64 = labels.astype(np.int64, copy=False)
+    flat_indices = np.arange(labels.size, dtype=np.int64).reshape(labels.shape)
+    flat_labels = labels64.ravel()
+    flat_edge_map = edge_map.ravel()
+
+    # For every neighbor offset in the footprint, collect pixels whose label
+    # differs from that of the offset neighbor. Each entry is a real pixel
+    # adjacency and therefore only produces a real region edge.
+    center_ids = []
+    neighbor_labels = []
+    for footprint_index in np.ndindex(footprint.shape):
+        offset = tuple(
+            footprint_index[d] - footprint.shape[d] // 2 for d in range(labels.ndim)
+        )
+        if not footprint[footprint_index] or all(o == 0 for o in offset):
+            continue
+
+        center_slices = []
+        neighbor_slices = []
+        for axis, step in enumerate(offset):
+            size = labels.shape[axis]
+            if step == 0:
+                center_slices.append(slice(None))
+                neighbor_slices.append(slice(None))
+            elif step > 0:
+                center_slices.append(slice(None, size - step))
+                neighbor_slices.append(slice(step, None))
+            else:
+                shift = -step
+                center_slices.append(slice(shift, None))
+                neighbor_slices.append(slice(None, size - shift))
+
+        center_slice = tuple(center_slices)
+        neighbor_slice = tuple(neighbor_slices)
+        center_label = labels64[center_slice]
+        adjacent_label = labels64[neighbor_slice]
+        different = center_label != adjacent_label
+        if not np.any(different):
+            continue
+
+        center_ids.append(flat_indices[center_slice][different])
+        neighbor_labels.append(adjacent_label[different])
 
     rag = RAG()
-    rag.add_weighted_edges_from(_edge_generator_from_csr(graph_matrix), weight='weight')
-    rag.add_weighted_edges_from(_edge_generator_from_csr(count_matrix), weight='count')
+    # Every label, including a region without any neighbor of another label,
+    # is a node of the graph.
+    for label in np.unique(labels64):
+        rag.add_node(int(label))
 
-    for n in rag.nodes():
-        rag.nodes[n].update({'labels': [n]})
+    if center_ids:
+        center_ids = np.concatenate(center_ids)
+        neighbor_labels = np.concatenate(neighbor_labels)
+
+        # A boundary pixel contributes its ``edge_map`` value once for every
+        # *distinct* neighboring region label. The footprint can reach the
+        # same region through several neighbor pixels (e.g. with
+        # ``connectivity == 2``); these must not count the contribution more
+        # than once for that region pair. Deduplicating ``(pixel, label)``
+        # also makes the aggregation independent of the iteration order.
+        pixel_neighbor = np.unique(
+            np.column_stack((center_ids, neighbor_labels)), axis=0
+        )
+        pixel_ids = pixel_neighbor[:, 0]
+        other_labels = pixel_neighbor[:, 1]
+
+        own_labels = flat_labels[pixel_ids]
+        labels_small = np.minimum(own_labels, other_labels)
+        labels_large = np.maximum(own_labels, other_labels)
+
+        # Boundary value belonging to each (pixel, neighboring region) pair.
+        data = flat_edge_map[pixel_ids].astype(np.float64, copy=False)
+
+        # Aggregate identical region pairs ourselves. The sample rows are
+        # ordered by their flat pixel index (``np.unique`` above sorts by
+        # ``(pixel, label)`` first), so every pair sums its boundary values in
+        # a fixed geometric order. This keeps weights bit-identical under any
+        # relabeling; sparse/COO summation order would depend on label values.
+        region_pairs, pair_index = np.unique(
+            np.column_stack((labels_small, labels_large)),
+            axis=0,
+            return_inverse=True,
+        )
+        pair_index = pair_index.ravel()
+        counts = np.bincount(pair_index)
+        sums = np.bincount(pair_index, weights=data)
+        weights = sums / counts
+
+        pair_small = region_pairs[:, 0]
+        pair_large = region_pairs[:, 1]
+
+        # Add edges directly with the original label ids. This avoids using
+        # label values as sparse-matrix indices, so arbitrary (including
+        # negative or very large) label numberings are supported.
+        for u, v, weight, count in zip(
+            pair_small, pair_large, weights, counts, strict=True
+        ):
+            rag.add_edge(
+                int(u),
+                int(v),
+                weight=float(weight),
+                count=int(count),
+            )
+
+    for node in rag.nodes():
+        rag.nodes[node].update({'labels': [node]})
 
     return rag
 
