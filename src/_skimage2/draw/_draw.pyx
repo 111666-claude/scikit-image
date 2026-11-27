@@ -365,6 +365,12 @@ def _circle_perimeter_aa(Py_ssize_t r_o, Py_ssize_t c_o,
     Wu's method draws anti-aliased circle. This implementation doesn't use
     lookup table optimization.
 
+    The eight-fold symmetry can map two Wu samples to the same pixel,
+    especially near the diagonals and for small radii. Merge those samples
+    before returning. The largest candidate weight is the sample whose
+    scanline passes closest to the ideal circle; keeping it also preserves
+    every pixel emitted by the symmetric sampling.
+
     References
     ----------
     .. [1] X. Wu, "An efficient antialiasing technique", In ACM SIGGRAPH
@@ -373,13 +379,24 @@ def _circle_perimeter_aa(Py_ssize_t r_o, Py_ssize_t c_o,
 
     cdef Py_ssize_t c = 0
     cdef Py_ssize_t r = radius
+    cdef Py_ssize_t i
+    cdef Py_ssize_t n
 
     cdef cnp.float64_t dceil = 0
     cdef cnp.float64_t dceil_prev = 0
+    cdef cnp.float64_t v
 
     cdef list rr = [r, c,  r,  c, -r, -c, -r, -c]
     cdef list cc = [c, r, -c, -r,  c,  r, -c, -r]
     cdef list val = [1] * 8
+
+    cdef dict merged = {}
+    cdef list order = []
+    cdef tuple key
+
+    cdef cnp.ndarray[cnp.intp_t, ndim=1] rr_arr
+    cdef cnp.ndarray[cnp.intp_t, ndim=1] cc_arr
+    cdef cnp.ndarray[cnp.float64_t, ndim=1] val_arr
 
     while r > c + 1:
         c += 1
@@ -396,14 +413,33 @@ def _circle_perimeter_aa(Py_ssize_t r_o, Py_ssize_t c_o,
         val.extend([1 - dceil, dceil] * 8)
         dceil_prev = dceil
 
+    # Symmetric coordinates can be repeated. For a repeated pixel, use the
+    # strongest Wu weight: it is the candidate measured from the scanline
+    # closest to the ideal circle.
+    for i in range(len(rr)):
+        key = (rr[i], cc[i])
+        v = val[i]
+        if key in merged:
+            if v > merged[key]:
+                merged[key] = v
+        else:
+            merged[key] = v
+            order.append(key)
+
+    n = len(order)
+    rr_arr = np.empty(n, dtype=np.intp)
+    cc_arr = np.empty(n, dtype=np.intp)
+    val_arr = np.empty(n, dtype=np.float64)
+
+    for i in range(n):
+        key = order[i]
+        rr_arr[i] = key[0] + r_o
+        cc_arr[i] = key[1] + c_o
+        val_arr[i] = merged[key]
+
     if shape is not None:
-        return _coords_inside_image(np.array(rr, dtype=np.intp) + r_o,
-                                    np.array(cc, dtype=np.intp) + c_o,
-                                    shape,
-                                    val=np.array(val, dtype=float))
-    return (np.array(rr, dtype=np.intp) + r_o,
-            np.array(cc, dtype=np.intp) + c_o,
-            np.array(val, dtype=float))
+        return _coords_inside_image(rr_arr, cc_arr, shape, val=val_arr)
+    return rr_arr, cc_arr, val_arr
 
 
 def _ellipse_perimeter(Py_ssize_t r_o, Py_ssize_t c_o, Py_ssize_t r_radius,

@@ -361,8 +361,8 @@ def test_circle_perimeter_aa():
         [[  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0],
          [  0,   0,   0,   0,   0,  82, 180, 236, 255, 236, 180,  82,   0,   0,   0,   0,   0],
          [  0,   0,   0,   0, 189, 172,  74,  18,   0,  18,  74, 172, 189,   0,   0,   0,   0],
-         [  0,   0,   0, 229,  25,   0,   0,   0,   0,   0,   0,   0,  25, 229,   0,   0,   0],
-         [  0,   0, 189,  25,   0,   0,   0,   0,   0,   0,   0,   0,   0,  25, 189,   0,   0],
+         [  0,   0,   0, 229,  65,   0,   0,   0,   0,   0,   0,   0,  65, 229,   0,   0,   0],
+         [  0,   0, 189,  65,   0,   0,   0,   0,   0,   0,   0,   0,   0,  65, 189,   0,   0],
          [  0,  82, 172,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0, 172,  82,   0],
          [  0, 180,  74,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  74, 180,   0],
          [  0, 236,  18,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  18, 236,   0],
@@ -370,8 +370,8 @@ def test_circle_perimeter_aa():
          [  0, 236,  18,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  18, 236,   0],
          [  0, 180,  74,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,  74, 180,   0],
          [  0,  82, 172,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0, 172,  82,   0],
-         [  0,   0, 189,  25,   0,   0,   0,   0,   0,   0,   0,   0,   0,  25, 189,   0,   0],
-         [  0,   0,   0, 229,  25,   0,   0,   0,   0,   0,   0,   0,  25, 229,   0,   0,   0],
+         [  0,   0, 189,  65,   0,   0,   0,   0,   0,   0,   0,   0,   0,  65, 189,   0,   0],
+         [  0,   0,   0, 229,  65,   0,   0,   0,   0,   0,   0,   0,  65, 229,   0,   0,   0],
          [  0,   0,   0,   0, 189, 172,  74,  18,   0,  18,  74, 172, 189,   0,   0,   0,   0],
          [  0,   0,   0,   0,   0,  82, 180, 236, 255, 236, 180,  82,   0,   0,   0,   0,   0],
          [  0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0,   0]]
@@ -390,6 +390,98 @@ def test_circle_perimeter_aa_shape():
     rr, cc, val = circle_perimeter_aa(7 + shift, 10, 9, shape=None)
     img_[rr, cc] = val * 255
     assert_array_equal(img, img_[shift:-shift, :])
+
+
+def _wu_scanline_weight(radius, r, c):
+    """Independent closest-scanline Wu weight for a pixel offset."""
+    r = abs(r)
+    c = abs(c)
+    candidates = []
+    if radius * radius - c * c >= 0:
+        y_ideal = np.sqrt(radius * radius - c * c)
+        candidates.append(max(0.0, 1.0 - abs(r - y_ideal)))
+    if radius * radius - r * r >= 0:
+        x_ideal = np.sqrt(radius * radius - r * r)
+        candidates.append(max(0.0, 1.0 - abs(c - x_ideal)))
+    return max(candidates)
+
+
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 5, 7, 8, 13, 25])
+def test_circle_perimeter_aa_unique_pixels_and_valid_weights(radius):
+    center = radius + 2
+    rr, cc, val = circle_perimeter_aa(center, center, radius)
+
+    assert len(rr) == len(cc) == len(val)
+    assert_equal(len(np.unique(np.column_stack((rr, cc)), axis=0)), len(rr))
+    assert np.all(val >= 0.0)
+    assert np.all(val <= 1.0)
+
+
+@pytest.mark.parametrize("radius", [0, 1, 2, 3, 4, 5, 7, 8, 13, 25])
+def test_circle_perimeter_aa_eightfold_symmetry(radius):
+    center = radius + 2
+    rr, cc, _ = circle_perimeter_aa(center, center, radius)
+    pixels = set(zip((rr - center).tolist(), (cc - center).tolist()))
+
+    for dr, dc in list(pixels):
+        symmetric = [
+            (dr, dc),
+            (-dr, dc),
+            (dr, -dc),
+            (-dr, -dc),
+            (dc, dr),
+            (-dc, dr),
+            (dc, -dr),
+            (-dc, -dr),
+        ]
+        for point in symmetric:
+            assert point in pixels
+
+
+def test_circle_perimeter_aa_radius7_conflicting_weights():
+    center = 8
+    radius = 7
+    rr, cc, val = circle_perimeter_aa(center, center, radius)
+    weights = {
+        (r - center, c - center): v
+        for r, c, v in zip(rr.tolist(), cc.tolist(), val.tolist())
+    }
+
+    # These eight pixels used to be emitted with two different weights.
+    offsets = [
+        (5, 4),
+        (5, -4),
+        (-5, 4),
+        (-5, -4),
+        (4, 5),
+        (4, -5),
+        (-4, 5),
+        (-4, -5),
+    ]
+    for offset in offsets:
+        assert offset in weights
+        assert_almost_equal(weights[offset], _wu_scanline_weight(radius, *offset))
+        assert_almost_equal(weights[offset], 0.2554373534619714)
+
+
+def test_circle_perimeter_aa_drawing_order_independent():
+    rr, cc, val = circle_perimeter_aa(8, 8, 7)
+    image = np.zeros((17, 17))
+    image[rr, cc] = val
+
+    reversed_order = np.arange(len(rr))[::-1]
+    reversed_image = np.zeros((17, 17))
+    reversed_image[rr[reversed_order], cc[reversed_order]] = val[reversed_order]
+
+    assert_array_equal(image, reversed_image)
+
+
+def test_circle_perimeter_aa_clipping_remains_unique():
+    rr, cc, val = circle_perimeter_aa(2, 2, 9, shape=(5, 5))
+
+    assert_equal(len(np.unique(np.column_stack((rr, cc)), axis=0)), len(rr))
+    assert np.all((rr >= 0) & (rr < 5) & (cc >= 0) & (cc < 5))
+    assert np.all((val >= 0.0) & (val <= 1.0))
 
 
 def test_ellipse_trivial():
