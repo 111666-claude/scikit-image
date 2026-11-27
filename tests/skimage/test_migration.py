@@ -834,7 +834,8 @@ SKIMAGE_API = {
     'skimage.draw:ellipse(r, c, r_radius, c_radius, shape=None, rotation=0.0)',
     'skimage.draw:ellipse_perimeter(r, c, r_radius, c_radius, orientation=0, '
     'shape=None)',
-    'skimage.draw:ellipsoid(a, b, c, spacing=(1.0, 1.0, 1.0), levelset=False)',
+    'skimage.draw:ellipsoid(a, b, c, spacing=(1.0, 1.0, 1.0), levelset=False, '
+    'rotation=None)',
     'skimage.draw:ellipsoid_stats(a, b, c)',
     'skimage.draw:line(r0, c0, r1, c1)',
     'skimage.draw:line_aa(r0, c0, r1, c1)',
